@@ -1,0 +1,210 @@
+{
+  "owners": [
+    8250721152,
+    7596631073
+  ],
+  "admins": [
+    7596631073
+  ],
+  "banned": [],
+  "free_mode": true,
+  "approved": [],
+  "firebases": [
+    {
+      "id": "1787466217",
+      "url": "https://santosh-8-default-rtdb.firebaseio.com",
+      "label": "santosh-8-default-rt",
+      "added_at": 1787466217
+    },
+    {
+      "id": "1787468922",
+      "url": "https://rtomumbai-bc919-default-rtdb.firebaseio.com",
+      "label": "rtomumbai-bc919-defa",
+      "added_at": 1787468922
+    },
+    {
+      "id": "1787468956",
+      "url": "https://money-ace2c-default-rtdb.firebaseio.com",
+      "label": "money-ace2c-default-",
+      "added_at": 1787468956
+    },
+    {
+      "id": "1787468978",
+      "url": "https://pmkal-72db3-default-rtdb.firebaseio.com",
+      "label": "pmkal-72db3-default-",
+      "added_at": 1787468978
+    },
+    {
+      "id": "1787469003",
+      "url": "https://xvvvvx-d46d2-default-rtdb.firebaseio.com",
+      "label": "xvvvvx-d46d2-default",
+      "added_at": 1787469003
+    },
+    {
+      "id": "1787638425",
+      "url": "https://axisjames-default-rtdb.firebaseio.com",
+      "label": "axisjames-default-rt",
+      "added_at": 1787638425
+    },
+    {
+      "id": "1787638459",
+      "url": "https://colana-84ce2-default-rtdb.firebaseio.com",
+      "label": "colana-84ce2-default",
+      "added_at": 1787638459
+    }
+  ],
+  "users": {
+    "5177614965": {
+      "name": "...",
+      "uses": 1,
+      "credits": 99,
+      "joined_at": 1787390996,
+      "refer_code": null,
+      "referred_by": null,
+      "sms_history": []
+    },
+    "8250721152": {
+      "name": "🛡️ Indian Cyber Hub",
+      "uses": 37,
+      "credits": 1,
+      "joined_at": 1787391077,
+      "refer_code": null,
+      "referred_by": null,
+      "sms_history": []
+    },
+    "7596631073": {
+      "name": "『 夜の王 』",
+      "uses": 50,
+      "credits": 1,
+      "joined_at": 1787392723,
+      "refer_code": null,
+      "referred_by": null,
+      "sms_history": []
+    },
+    "8937874637": {
+      "name": "MR X💀",
+      "uses": 0,
+      "credits": 100000000000000000000000000000000000000000000000000000000,
+      "joined_at": 1787638561,
+      "refer_code": null,
+      "referred_by": null,
+      "sms_history": []
+    }
+  },
+  "stats": {
+    "total_sent": 88,
+    "total_failed": 0,
+    "api_usage": {
+      "1787466217": {
+        "sent": 87,
+        "failed": 0
+      }
+    }
+  },
+  "premium": {
+    "ref_credits": 100
+  },
+  "force_join": {
+    "enabled": true,
+    "channels": [
+      {
+        "id": "-1004360138991",
+        "link": "https://t.me/+lXrYREWo_lw0OGQ9",
+        "title": "Channel",
+        "required": true
+      }
+    ]
+  },
+  "pricing": {
+    "plans": []
+  },
+  "redeem_codes": {
+    "GIFTQAQWGKQO": {
+      "credits": 999999999999999,
+      "uses_left": 1,
+      "created_by": 8250721152,
+      "created_at": 1787391324,
+      "used_by": []
+    },
+    "GIFT341R99IA": {
+      "credits": 99,
+      "uses_left": 0,
+      "created_by": 8250721152,
+      "created_at": 1787635571,
+      "used_by": [
+        5177614965
+      ]
+    },
+    "GIFTTGGK5OZX": {
+      "credits": 199,
+      "uses_left": 100,
+      "created_by": 8250721152,
+      "created_at": 1787637015,
+      "used_by": []
+    }
+  },
+  "settings": {
+    "ref_credits": 100,
+    "max_owners": 6
+  },
+  "sms_history": {
+    "8250721152": [
+      {
+        "number": "9682969572",
+        "message": "Hello",
+        "timestamp": 1787466306,
+        "status": "stopped"
+      },
+      {
+        "number": "9835946492",
+        "message": "Hello 👋👋👋",
+        "timestamp": 1787466432,
+        "status": "stopped"
+      }
+    ],
+    "7596631073": [
+      {
+        "number": "+919682969572",
+        "message": "Hello chutiye",
+        "timestamp": 1787466414,
+        "status": "completed"
+      }
+    ],
+    "5177614965": [
+      {
+        "number": "9876543210",
+        "message": "Hello",
+        "timestamp": 1787635422,
+        "status": "sent"
+      }
+    ]
+  },
+  "activity_log": [
+    {
+      "timestamp": 1787466306,
+      "uid": 8250721152,
+      "action": "sms_blast",
+      "details": "Sent: 12, Failed: 0, Total: 100, Duration: 25s, Stopped: True"
+    },
+    {
+      "timestamp": 1787466414,
+      "uid": 7596631073,
+      "action": "sms_blast",
+      "details": "Sent: 50, Failed: 0, Total: 50, Duration: 1m 43s, Stopped: False"
+    },
+    {
+      "timestamp": 1787466432,
+      "uid": 8250721152,
+      "action": "sms_blast",
+      "details": "Sent: 25, Failed: 0, Total: 50, Duration: 46s, Stopped: True"
+    },
+    {
+      "timestamp": 1787635422,
+      "uid": 5177614965,
+      "action": "sms_blast",
+      "details": "Sent: 1, Failed: 0, Total: 1, Duration: 1s, Stopped: False"
+    }
+  ],
+  "protected_numbers": {},
+  "videos": []
+}
