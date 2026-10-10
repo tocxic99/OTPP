@@ -16,6 +16,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,11 +27,38 @@ logging.basicConfig(
 )
 log = logging.getLogger("BlastBot")
 
-# ================= MONGODB CONFIG =================
-MONGO_URI = "mongodb+srv://gogo_db_user:4DfbHqcjpjg6TYb8@firebase.snn8z2u.mongodb.net"
-MONGO_DB_NAME = "olympic"
-MONGO_COLLECTION = "bot_state"
+# ================= APPLICATION CONFIG =================
+# Secrets and deployment-specific IDs must come from the environment.
+def _int_env(name: str, default: int = 0) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "olympic").strip() or "olympic"
+MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "bot_state").strip() or "bot_state"
 MONGO_DOC_ID = "main"
+MAIN_OWNER = _int_env("MAIN_OWNER_ID")
+OWNER_NAME = os.getenv("OWNER_NAME", "Configured owner").strip() or "Configured owner"
+LOG_CHANNEL_ID = _int_env("LOG_CHANNEL_ID")
+
+
+def validate_configuration() -> None:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not MONGO_URI:
+        missing.append("MONGO_URI")
+    if MAIN_OWNER <= 0:
+        missing.append("MAIN_OWNER_ID")
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 _mongo_client = None
 _mongo_col = None
@@ -183,14 +213,9 @@ def kb(*rows) -> InlineKeyboardMarkup:
     ])
 
 # ========== OWNER CONFIG ==========
-MAIN_OWNER = 8617986101
-OWNER_NAME = "Roronoazero"
-SUPER_ADMIN_NAME = "Roronoazero"
-SUPER_ADMIN_LINK = "https://t.me/Roronoazero1"
-SUPER_ADMINS = [8617986101]
-
-BOT_TOKEN = "8940033297:AAHSUj6OgWX3U7QqUmbCiFmmeLM-YgSexb4"
-LOG_CHANNEL_ID = -1003929619180
+SUPER_ADMIN_NAME = OWNER_NAME
+SUPER_ADMIN_LINK = os.getenv("SUPER_ADMIN_LINK", "https://t.me/").strip()
+SUPER_ADMINS = [MAIN_OWNER] if MAIN_OWNER else []
 
 _VERSION = "𝗩5 ᴍᴏɴɢᴏ ᴘʀᴇᴍɪᴜᴍ ᴘʀᴏ"
 _PROGRESS_UPDATE_INTERVAL = 1.0
@@ -489,37 +514,14 @@ async def send_fire_effect_private(bot: Bot, chat_id: int):
         log.warning(f"Fire effect: {e}")
 
 async def send_channel_log(bot: Bot, text: str):
+    if not LOG_CHANNEL_ID:
+        return
     try:
         await bot.send_message(LOG_CHANNEL_ID, text, parse_mode="HTML")
     except Exception as e:
         log.error(f"Channel log fail: {e}")
 
 # ========== FIREBASE ==========
-async def fb_get(base_url: str, path: str) -> dict:
-    url = base_url.rstrip("/") + path
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=_FB_PER_FB_TIMEOUT)) as r:
-                if r.status == 200:
-                    txt = (await r.text()).strip()
-                    if txt == "null" or not txt: return {}
-                    return json.loads(txt)
-    except Exception as e:
-        log.debug(f"fb_get {url}: {e}")
-    return {}
-
-async def fb_put(base_url: str, path: str, payload: dict) -> bool:
-    url = base_url.rstrip("/") + path
-    for attempt in range(3):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.put(url, json=payload, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                    if 200 <= r.status < 300: return True
-        except Exception as e:
-            log.warning(f"fb_put attempt {attempt+1}: {e}")
-        await asyncio.sleep(0.5 * (attempt + 1))
-    return False
-
 def device_is_online(device_data: dict) -> bool:
     return any([
         device_data.get("isOnline"),
@@ -530,235 +532,22 @@ def device_is_online(device_data: dict) -> bool:
 
 # ========== INSTANT FIREBASE CHECK (One-time at add) ==========
 async def check_firebase_online(url: str) -> tuple:
-    """Firebase ko ek baar check karta hai. Returns (is_online, device_count, error)."""
-    shallow_url = url.rstrip("/") + "/clients.json?shallow=true"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(shallow_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 200:
-                    return False, 0, f"HTTP {r.status}"
-                txt = (await r.text()).strip()
-                if txt == "null" or not txt:
-                    return False, 0, "No clients node (empty DB)"
-                try:
-                    data = json.loads(txt)
-                except:
-                    return False, 0, "Invalid JSON response"
-                if not isinstance(data, dict) or not data:
-                    return False, 0, "No devices registered"
-
-                dev_ids = list(data.keys())[:30]
-                online_count = 0
-                for dev_id in dev_ids:
-                    try:
-                        dev_url = url.rstrip("/") + f"/clients/{dev_id}.json"
-                        async with s.get(dev_url, timeout=aiohttp.ClientTimeout(total=5)) as r2:
-                            if r2.status == 200:
-                                txt2 = (await r2.text()).strip()
-                                if txt2 and txt2 != "null":
-                                    dev = json.loads(txt2)
-                                    if isinstance(dev, dict) and device_is_online(dev):
-                                        online_count += 1
-                    except Exception:
-                        pass
-
-                if online_count > 0:
-                    return True, online_count, ""
-                else:
-                    return False, 0, f"{len(dev_ids)} devices registered but 0 online"
-    except asyncio.TimeoutError:
-        return False, 0, "Timeout (DB slow or unreachable)"
-    except aiohttp.ClientConnectorError:
-        return False, 0, "Connection failed (invalid URL or DB deleted)"
-    except Exception as e:
-        return False, 0, f"Error: {str(e)[:50]}"
+    """Remote Firebase probing is disabled in this imported copy."""
+    return False, 0, "Firebase probing is disabled in this imported copy"
 
 async def get_all_online_devices(d: dict) -> list:
-    fbs = d.get("firebases", [])
-    if not fbs: return []
-    results = []
-    current_fb_ids = {fb["id"] for fb in fbs}
-    global CACHED_DEVICES
-    CACHED_DEVICES = [dev for dev in CACHED_DEVICES if dev.get("fb_id") in current_fb_ids]
-    _fb_sem = asyncio.Semaphore(_FB_CONCURRENT_SCAN)
-
-    async def fetch_one(fb: dict):
-        async with _fb_sem:
-            shallow_url = fb["url"].rstrip("/") + "/clients.json?shallow=true"
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(shallow_url, timeout=aiohttp.ClientTimeout(total=_FB_PER_FB_TIMEOUT)) as r:
-                        if r.status != 200: return
-                        txt = (await r.text()).strip()
-                        if txt == "null" or not txt: return
-                        device_ids = json.loads(txt)
-                        if not isinstance(device_ids, dict): return
-                        dev_ids = list(device_ids.keys())[:_FB_MAX_DEVICES_PER_DB]
-                        _dev_sem = asyncio.Semaphore(5)
-
-                        async def fetch_dev(dev_id: str):
-                            async with _dev_sem:
-                                try:
-                                    url = fb["url"].rstrip("/") + f"/clients/{dev_id}.json"
-                                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=_FB_DEVICE_TIMEOUT)) as r2:
-                                        if r2.status == 200:
-                                            txt2 = (await r2.text()).strip()
-                                            if txt2 == "null" or not txt2: return None
-                                            dev_data = json.loads(txt2)
-                                            if isinstance(dev_data, dict) and device_is_online(dev_data):
-                                                name = dev_data.get("deviceName") or dev_data.get("name") or dev_id[:16]
-                                                return {
-                                                    "fb_id": fb["id"], "fb_url": fb["url"],
-                                                    "fb_label": fb.get("label", fb["url"][:30]),
-                                                    "dev_id": dev_id, "dev_name": name,
-                                                    "sims": dev_data.get("sims", []),
-                                                }
-                                except Exception: pass
-                                return None
-
-                        for i in range(0, len(dev_ids), 10):
-                            batch = dev_ids[i:i+10]
-                            dev_results = await asyncio.gather(*[fetch_dev(x) for x in batch], return_exceptions=True)
-                            for res in dev_results:
-                                if res and isinstance(res, dict):
-                                    results.append(res)
-            except Exception as e:
-                log.debug(f"fb scan {fb['url']}: {e}")
-
-    for i in range(0, len(fbs), _FB_BATCH_SIZE):
-        batch = fbs[i:i+_FB_BATCH_SIZE]
-        log.info(f"[SCAN] Batch {i//_FB_BATCH_SIZE + 1}/{(len(fbs) + _FB_BATCH_SIZE - 1)//_FB_BATCH_SIZE}")
-        await asyncio.gather(*[fetch_one(fb) for fb in batch], return_exceptions=True)
-        await asyncio.sleep(0.5)
-
-    log.info(f"[SCAN] {len(results)} online devices from {len(fbs)} DBs")
-    return results
+    """Device discovery is disabled; do not query configured Firebase URLs."""
+    return []
 
 async def send_sms_via_device(fb_url: str, dev_id: str, sim_slot: int, to: str, message: str) -> bool:
-    return await fb_put(fb_url, f"/clients/{dev_id}/webhookEvent/sendSms.json", {
-        "from": sim_slot, "to": to.strip(), "message": message.strip(),
-        "isSended": False, "timestamp": int(time.time())
-    })
+    """Outbound SMS delivery is deliberately disabled in this imported copy."""
+    log.warning("SMS delivery is disabled; no external request was made.")
+    return False
 
 # ========== BACKGROUND SCANNER + AUTO-CLEANUP ==========
 async def background_firebase_scanner(bot: Bot):
-    global CACHED_DEVICES, LAST_SCAN_TIME, SCANNING_IN_PROGRESS, SCAN_STATUS, DEVICE_HEALTH_LOG
-    global FB_FAIL_COUNT, LAST_CLEANUP_TIME, LAST_CLEANUP_REMOVED, AUTO_CLEANUP_ENABLED
-    log.info("Scanner STARTED")
-    first_scan_done = False
-
-    while True:
-        async with SCAN_LOCK:
-            if SCANNING_IN_PROGRESS:
-                await asyncio.sleep(5); continue
-            SCANNING_IN_PROGRESS = True
-        SCAN_STATUS = f"{em(EMOJI_WARNING, '🔍')} sᴄᴀɴɴɪɴɢ..."
-        start_scan = time.time()
-        try:
-            d = load()
-            fbs = d.get("firebases", [])
-            if not fbs:
-                SCAN_STATUS = f"{em(EMOJI_WARNING, '⚠️')} ɴᴏ ᴅʙs"
-                CACHED_DEVICES = []
-                async with SCAN_LOCK: SCANNING_IN_PROGRESS = False
-                await asyncio.sleep(_BACKGROUND_SCAN_INTERVAL); continue
-
-            devices = await get_all_online_devices(d)
-            scan_duration = time.time() - start_scan
-            CACHED_DEVICES = devices
-
-            new_fb_counts = {}
-            to_delete = []
-
-            for fb in fbs:
-                fb_id = fb["id"]
-                fb_online = sum(1 for dv in devices if dv["fb_id"] == fb_id)
-                new_fb_counts[fb_id] = {
-                    "label": fb.get("label", fb["url"][:30]),
-                    "online": fb_online,
-                    "last_update": int(time.time())
-                }
-
-                if AUTO_CLEANUP_ENABLED:
-                    if fb_online == 0:
-                        FB_FAIL_COUNT[fb_id] = FB_FAIL_COUNT.get(fb_id, 0) + 1
-                        if FB_FAIL_COUNT[fb_id] >= _FB_AUTO_DELETE_THRESHOLD:
-                            to_delete.append(fb)
-                    else:
-                        FB_FAIL_COUNT[fb_id] = 0
-                else:
-                    FB_FAIL_COUNT[fb_id] = 0
-
-            FB_DEVICE_COUNTS.clear()
-            FB_DEVICE_COUNTS.update(new_fb_counts)
-            LAST_SCAN_TIME = time.time()
-
-            # Auto-delete if enabled
-            if to_delete:
-                d_fresh = load()
-                removed_labels = []
-                for dead_fb in to_delete:
-                    d_fresh["firebases"] = [
-                        f for f in d_fresh.get("firebases", [])
-                        if f["id"] != dead_fb["id"]
-                    ]
-                    FB_FAIL_COUNT.pop(dead_fb["id"], None)
-                    FB_DEVICE_COUNTS.pop(dead_fb["id"], None)
-                    removed_labels.append(dead_fb.get("label", dead_fb["url"][:30]))
-                await safe_save(d_fresh)
-
-                LAST_CLEANUP_TIME = int(time.time())
-                LAST_CLEANUP_REMOVED = len(removed_labels)
-                log.info(f"[AUTO-CLEANUP] Removed {len(removed_labels)} dead firebases")
-
-                if removed_labels:
-                    try:
-                        notify_text = (
-                            f"{em(EMOJI_TRASH, '🗑')} <b>Auto-Cleanup Report</b>\n\n"
-                            f"{em(EMOJI_FIRE, '🔥')} <b>{len(removed_labels)}</b> dead firebases removed\n"
-                            f"<i>(3 consecutive scans me 0 devices the)</i>\n\n"
-                        )
-                        for lbl in removed_labels[:10]:
-                            notify_text += f"  • <code>{lbl}</code>\n"
-                        if len(removed_labels) > 10:
-                            notify_text += f"  <i>+{len(removed_labels)-10} more</i>"
-                        notify_text += (
-                            f"\n\n{em(EMOJI_CHECK, '📊')} Remaining DBs: "
-                            f"<b>{len(d_fresh.get('firebases', []))}</b>\n\n"
-                            f"<i>Disable karne ke liye: Settings → 🗑 Auto-Cleanup</i>"
-                        )
-                        await bot.send_message(MAIN_OWNER, notify_text, parse_mode="HTML")
-                    except Exception as e:
-                        log.warning(f"Cleanup notify: {e}")
-
-            DEVICE_HEALTH_LOG.append({
-                "timestamp": int(time.time()), "devices_found": len(devices),
-                "dbs_scanned": len(fbs), "duration_sec": round(scan_duration, 2)
-            })
-            if len(DEVICE_HEALTH_LOG) > 100:
-                DEVICE_HEALTH_LOG = DEVICE_HEALTH_LOG[-100:]
-
-            if devices:
-                SCAN_STATUS = f"{em(EMOJI_CHECK, '🟢')} {len(devices)} ᴅᴇᴠɪᴄᴇs"
-                if not first_scan_done:
-                    try:
-                        await bot.send_message(MAIN_OWNER,
-                            f"{em(EMOJI_ROCKET, '🚀')} <b>{sc('scanner active!')}</b>\n\n"
-                            f"{em(EMOJI_PHONE, '📱')} ᴅᴇᴠɪᴄᴇs: <b>{len(devices)}</b>\n"
-                            f"{em(EMOJI_FIRE, '🔥')} ᴅʙs: <b>{len(fbs)}</b>\n"
-                            f"{em(EMOJI_WARNING, '⏱')} {scan_duration:.1f}s",
-                            parse_mode="HTML")
-                    except: pass
-                    first_scan_done = True
-            else:
-                SCAN_STATUS = f"{em(EMOJI_CROSS, '🔴')} ɴᴏ ᴅᴇᴠɪᴄᴇs"
-        except Exception as e:
-            SCAN_STATUS = f"{em(EMOJI_CROSS, '❌')} ᴇʀʀᴏʀ"
-            log.error(f"[BG-SCAN] {e}")
-        finally:
-            async with SCAN_LOCK:
-                SCANNING_IN_PROGRESS = False
-        await asyncio.sleep(_BACKGROUND_SCAN_INTERVAL)
+    """The background Firebase scanner is disabled in this imported copy."""
+    log.info("Firebase scanner is disabled")
 
 def get_cached_devices() -> list:
     return CACHED_DEVICES
@@ -883,14 +672,14 @@ def user_home_text(uid: int, d: dict) -> str:
         f"{em(EMOJI_FIRE, '🔥')} ᴀᴘɪs    : <b>{len(fbs)}</b>\n"
         f"{em(EMOJI_GEAR, '🔄')} sᴄᴀɴɴᴇʀ : {scan_info}\n"
         f"╚══════════════════╝\n\n"
-        f"ᴛᴀᴘ <b>{sc('send sms')}</b> ᴛᴏ sᴛᴀʀᴛ {em(EMOJI_ROCKET, '🚀')}"
+        f"{sc('Bulk SMS delivery is disabled in this imported copy.')}"
     )
 
 # ========== KEYBOARDS ==========
 def owner_kb(d: dict) -> InlineKeyboardMarkup:
     mode_btn = (f"🔴 {sc('disable free mode')}", "owner:free:off") if d.get("free_mode") else (f"🟢 {sc('enable free mode')}", "owner:free:on")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("sᴇɴᴅ sᴍs", "owner:send", EMOJI_ROCKET, "📤"), btn("ᴍᴀɴᴀɢᴇ ғɪʀᴇʙᴀsᴇ", "owner:fb:menu:0", EMOJI_FIRE, "🔥")],
+        [btn("sᴍs ᴅɪsᴀʙʟᴇᴅ", "owner:send", EMOJI_WARNING, "🚫"), btn("ᴍᴀɴᴀɢᴇ ғɪʀᴇʙᴀsᴇ", "owner:fb:menu:0", EMOJI_FIRE, "🔥")],
         [btn("ᴍᴀɴᴀɢᴇ sᴜᴘᴇʀ ᴀᴅᴍɪɴs", "owner:owners:menu", EMOJI_CROWN, "👑"), btn("ᴍᴀɴᴀɢᴇ ᴀᴅᴍɪɴs", "owner:admins:menu", EMOJI_SHIELD, "🛡")],
         [btn("ᴠɪᴇᴡ ᴜsᴇʀs", "owner:users:list", EMOJI_STAR, "👥"), btn("ʙᴀɴ ᴜsᴇʀ", "owner:ban", EMOJI_CROSS, "🚫")],
         [btn("ᴜɴʙᴀɴ ᴜsᴇʀ", "owner:unban:menu", EMOJI_CHECK, "✅"), btn("ʙʀᴏᴀᴅᴄᴀsᴛ", "owner:broadcast", EMOJI_BELL, "📢")],
@@ -908,7 +697,7 @@ def owner_kb(d: dict) -> InlineKeyboardMarkup:
 
 def admin_kb(d: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("sᴇɴᴅ sᴍs", "admin:send", EMOJI_ROCKET, "📤"), btn("ᴠɪᴇᴡ ᴜsᴇʀs", "admin:users:list", EMOJI_STAR, "👥")],
+        [btn("sᴍs ᴅɪsᴀʙʟᴇᴅ", "admin:send", EMOJI_WARNING, "🚫"), btn("ᴠɪᴇᴡ ᴜsᴇʀs", "admin:users:list", EMOJI_STAR, "👥")],
         [btn("ᴀᴘɪ sᴛᴀᴛs", "admin:stats", EMOJI_STAR, "📊"), btn("ʙᴀɴ ᴜsᴇʀ", "admin:ban", EMOJI_CROSS, "🚫")],
         [btn("ᴜɴʙᴀɴ ᴜsᴇʀ", "admin:unban:menu", EMOJI_CHECK, "✅"), btn("ʙʀᴏᴀᴅᴄᴀsᴛ", "admin:broadcast", EMOJI_BELL, "📢")],
         [btn("ʀᴇғʀᴇsʜ", "admin:refresh", EMOJI_GEAR, "🔄")],
@@ -916,7 +705,7 @@ def admin_kb(d: dict) -> InlineKeyboardMarkup:
 
 def user_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("sᴇɴᴅ sᴍs", "user:send", EMOJI_ROCKET, "📤")],
+        [btn("sᴍs ᴅɪsᴀʙʟᴇᴅ", "user:send", EMOJI_WARNING, "🚫")],
         [btn("ᴄʀᴇᴅɪᴛs", "user:credits", EMOJI_MONEY, "💳"), btn("ʀᴇᴅᴇᴇᴍ", "user:redeem", EMOJI_GIFT, "🎁")],
         [btn("ʀᴇғᴇʀ", "user:refer", EMOJI_STAR, "👥"), btn("sᴛᴀᴛs", "user:stats", EMOJI_STAR, "📊")],
         [btn("ᴍʏ sᴍs ʜɪsᴛᴏʀʏ", "user:sms_history", EMOJI_STAR, "📜"), btn("ʙᴜʏ ᴄʀᴇᴅɪᴛs", "user:pricing", EMOJI_MONEY, "💰")],
@@ -1148,18 +937,8 @@ async def noop(cq: CallbackQuery):
 # ================= USER SMS FLOW =================
 @R.callback_query(F.data == "user:send")
 async def user_send_start(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    uid = cq.from_user.id
-    joined, missing = await user_joined_all(cq.bot, uid, d)
-    if not joined:
-        await cq.answer("⛔ Force Join!", show_alert=True)
-        await cq.message.edit_text(force_join_text(missing), reply_markup=force_join_kb(missing), parse_mode="HTML", disable_web_page_preview=True); return
-    if not can_use(uid, d):
-        await cq.answer("🚫 Access denied!", show_alert=True); return
-    await state.set_state(S.send_number)
-    await cq.message.edit_text(
-        f"{em(EMOJI_PHONE, '📞')} <b>{sc('step 1/4')} — {sc('number')}</b>\n\nNumber daalo:",
-        reply_markup=kb([(sc('cancel'), "user:home")]), parse_mode="HTML")
+    await state.clear()
+    await cq.answer("Bulk SMS delivery is disabled in this imported copy.", show_alert=True)
 
 @R.message(S.send_number, F.text)
 async def user_got_number(msg: Message, state: FSMContext):
@@ -1239,13 +1018,8 @@ async def user_got_count_invalid(msg: Message):
 # ================= OWNER SMS FLOW =================
 @R.callback_query(F.data == "owner:send")
 async def owner_send_start(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        await cq.answer("🚫 Owner only!", show_alert=True); return
-    await state.set_state(S.owner_send_number)
-    await cq.message.edit_text(
-        f"{em(EMOJI_CROWN, '👑')} <b>Owner SMS</b>\n\n{em(EMOJI_PHONE, '📞')} <b>{sc('step 1/4')}</b>\n\nNumber daalo:",
-        reply_markup=kb([(sc('cancel'), "owner:home")]), parse_mode="HTML")
+    await state.clear()
+    await cq.answer("Bulk SMS delivery is disabled in this imported copy.", show_alert=True)
 
 @R.message(S.owner_send_number, F.text)
 async def owner_got_number(msg: Message, state: FSMContext):
@@ -1307,13 +1081,8 @@ async def owner_got_count_invalid(msg: Message):
 # ================= ADMIN SMS FLOW =================
 @R.callback_query(F.data == "admin:send")
 async def admin_send_start(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_admin(cq.from_user.id, d):
-        await cq.answer("🚫 Admin only!", show_alert=True); return
-    await state.set_state(S.admin_send_number)
-    await cq.message.edit_text(
-        f"{em(EMOJI_SHIELD, '🛡')} <b>Admin SMS</b>\n\n{em(EMOJI_PHONE, '📞')} <b>{sc('step 1/4')}</b>\n\nNumber daalo:",
-        reply_markup=kb([(sc('cancel'), "admin:home")]), parse_mode="HTML")
+    await state.clear()
+    await cq.answer("Bulk SMS delivery is disabled in this imported copy.", show_alert=True)
 
 @R.message(S.admin_send_number, F.text)
 async def admin_got_number(msg: Message, state: FSMContext):
@@ -1378,167 +1147,8 @@ async def admin_got_count_invalid(msg: Message):
 
 # ================= SMS BLAST CORE =================
 async def run_sms_blast_with_progress(bot: Bot, msg: Message, uid: int, number: str, message: str, count: int, devices: list, speed: float = SPEED_DEFAULT):
-    async with SESSIONS_LOCK:
-        if uid in USER_SESSIONS:
-            old = USER_SESSIONS[uid]
-            if old.task and not old.task.done():
-                await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} <b>Ek sending chal rahi hai!</b>", parse_mode="HTML"); return
-            del USER_SESSIONS[uid]
-        session = UserSession(uid)
-        session.number = number
-        USER_SESSIONS[uid] = session
-
-    is_regular_user = not is_admin(uid, load())
-    current_credits = get_user_credits(uid, load()) if is_regular_user else None
-    speed_label_display = "🚀 FAST" if speed == SPEED_FAST else "⚡ MEDIUM" if speed == SPEED_MEDIUM else "🐢 SLOW"
-
-    try:
-        progress_msg = await msg.answer(progress_text(0, 0, count, current_credits, speed_label_display),
-            reply_markup=stop_send_kb(), parse_mode="HTML")
-    except Exception as e:
-        log.error(f"Progress msg fail: {e}")
-        async with SESSIONS_LOCK:
-            if uid in USER_SESSIONS: del USER_SESSIONS[uid]
-        return
-
-    sent_ok = 0
-    sent_fail = 0
-    msgs_left = count
-    api_usage_delta = {}
-    last_update_time = time.time()
-    start_time = time.time()
-
-    async def do_send():
-        nonlocal sent_ok, sent_fail, msgs_left, last_update_time
-        try:
-            for device in devices:
-                if msgs_left <= 0: break
-                async with session.lock:
-                    if session.cancelled: break
-                fb_id = device["fb_id"]; fb_url = device["fb_url"]; dev_id = device["dev_id"]
-                sims = device["sims"]
-                sim_slots = [s.get("simSlotIndex", 0) for s in sims] if sims else [0]
-                device_quota = min(3, msgs_left)
-                device_sent = 0
-                for sim in sim_slots:
-                    async with session.lock:
-                        if device_sent >= device_quota or msgs_left <= 0 or session.cancelled: break
-                    ok = await send_sms_via_device(fb_url, dev_id, sim, number, message)
-                    async with session.lock:
-                        if ok:
-                            sent_ok += 1; device_sent += 1; msgs_left -= 1
-                            if is_regular_user:
-                                d_temp = load()
-                                deduct_credits(uid, 1, d_temp)
-                                d_temp["stats"]["total_sent"] = d_temp["stats"].get("total_sent", 0) + 1
-                                k = str(uid)
-                                if k in d_temp["users"]:
-                                    d_temp["users"][k]["uses"] = d_temp["users"][k].get("uses", 0) + 1
-                                d_temp.setdefault("sms_history", {}).setdefault(str(uid), []).append({
-                                    "number": number, "message": message[:100],
-                                    "timestamp": int(time.time()), "status": "sent"})
-                                save(d_temp)
-                        else:
-                            sent_fail += 1; msgs_left -= 1
-                        if fb_id not in api_usage_delta:
-                            api_usage_delta[fb_id] = {"sent": 0, "failed": 0}
-                        api_usage_delta[fb_id]["sent" if ok else "failed"] += 1
-                        now = time.time()
-                        if (now - last_update_time >= _PROGRESS_UPDATE_INTERVAL or (sent_ok + sent_fail) == count or session.cancelled):
-                            current_live = get_user_credits(uid, load()) if is_regular_user else None
-                            try:
-                                await progress_msg.edit_text(
-                                    progress_text(sent_ok, sent_fail, count, current_live, speed_label_display),
-                                    reply_markup=stop_send_kb() if not session.cancelled else None,
-                                    parse_mode="HTML")
-                            except TelegramBadRequest: pass
-                            last_update_time = now
-                    await asyncio.sleep(speed)
-        except Exception as e:
-            log.error(f"Send loop error for {uid}: {e}")
-        finally:
-            async with session.lock:
-                session.sent = sent_ok
-                session.failed = sent_fail
-
-    task = asyncio.create_task(do_send())
-    session.task = task
-    await task
-    was_cancelled = session.cancelled
-
-    async with SESSIONS_LOCK:
-        if uid in USER_SESSIONS: del USER_SESSIONS[uid]
-
-    d_final = load()
-    if not is_regular_user:
-        d_final["stats"]["total_sent"] = d_final["stats"].get("total_sent", 0) + sent_ok
-        d_final["stats"]["total_failed"] = d_final["stats"].get("total_failed", 0) + sent_fail
-        for fb_id, delta in api_usage_delta.items():
-            d_final["stats"].setdefault("api_usage", {}).setdefault(fb_id, {"sent": 0, "failed": 0})
-            d_final["stats"]["api_usage"][fb_id]["sent"] += delta["sent"]
-            d_final["stats"]["api_usage"][fb_id]["failed"] += delta["failed"]
-        k = str(uid)
-        if k in d_final["users"]:
-            d_final["users"][k]["uses"] = d_final["users"][k].get("uses", 0) + sent_ok
-        d_final.setdefault("sms_history", {}).setdefault(str(uid), []).append({
-            "number": number, "message": message[:100],
-            "timestamp": int(time.time()), "status": "completed" if not was_cancelled else "stopped"})
-    else:
-        d_final["stats"]["total_failed"] = d_final["stats"].get("total_failed", 0) + sent_fail
-        for fb_id, delta in api_usage_delta.items():
-            d_final["stats"].setdefault("api_usage", {}).setdefault(fb_id, {"sent": 0, "failed": 0})
-            d_final["stats"]["api_usage"][fb_id]["failed"] += delta["failed"]
-    save(d_final)
-
-    d_log = load()
-    duration = int(time.time() - start_time)
-    log_activity(d_log, "sms_blast", uid, f"Sent: {sent_ok}, Failed: {sent_fail}, Total: {count}, Duration: {fmt_duration(duration)}, Stopped: {was_cancelled}")
-    save(d_log)
-
-    try:
-        u_chat = await bot.get_chat(uid)
-        u_name = u_chat.full_name or "Unknown"
-        u_uname = f"@{u_chat.username}" if u_chat.username else "No Username"
-    except Exception:
-        u_name = d_log.get("users", {}).get(str(uid), {}).get("name", "Unknown")
-        u_uname = "No Username"
-
-    asyncio.create_task(send_channel_log(bot,
-        f"🚀 <b>SMS BLAST</b>\n\n👤 {u_name}\n🆔 <code>{uid}</code>\n🌐 {u_uname}\n"
-        f"📞 <code>{number}</code>\n💬 <code>{message}</code>\n"
-        f"✅ Sent: <b>{sent_ok}</b>\n❌ Failed: <b>{sent_fail}</b>\n"
-        f"📊 Count: <b>{count}</b>\n⏱ <b>{fmt_duration(duration)}</b>\n"
-        f"🛑 {'STOPPED' if was_cancelled else 'COMPLETED'}"))
-
-    if sent_fail == 0 and sent_ok > 0: icon = em(EMOJI_CHECK, "✅")
-    elif sent_ok > 0: icon = em(EMOJI_WARNING, "⚠️")
-    else: icon = em(EMOJI_CROSS, "❌")
-
-    credit_text = ""
-    if is_regular_user:
-        remaining = get_user_credits(uid, load())
-        credit_text = f"\n{em(EMOJI_MONEY, '💰')} Used: <b>{sent_ok}</b>\n{em(EMOJI_MONEY, '💳')} Left: <b>{remaining}</b>"
-
-    stopped_text = f"\n{em(EMOJI_CROSS, '🛑')} <b>Stopped!</b>" if was_cancelled else ""
-    duration_text = f"\n{em(EMOJI_GEAR, '⏱')} Duration: <b>{fmt_duration(int(time.time() - start_time))}</b>"
-
-    if is_owner(uid, load()): back_btn = [btn("ᴏᴡɴᴇʀ ᴘᴀɴᴇʟ", "owner:home", EMOJI_GEAR, "🔙")]
-    elif is_admin(uid, load()): back_btn = [btn("ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", "admin:home", EMOJI_GEAR, "🔙")]
-    else: back_btn = [btn("sᴇɴᴅ ᴀɴᴏᴛʜᴇʀ", "user:send", EMOJI_ROCKET, "📤"), btn("ʜᴏᴍᴇ", "user:home", EMOJI_STAR, "🏠")]
-
-    try:
-        await progress_msg.edit_text(
-            f"{icon} <b>SMS Blast Result</b>{stopped_text}\n\n"
-            f"{em(EMOJI_PHONE, '📞')} To: <code>{mask_number(number)}</code>\n"
-            f"{em(EMOJI_STAR, '💬')} Message: <code>{message[:50]}{'...' if len(message)>50 else ''}</code>\n"
-            f"{em(EMOJI_CHECK, '✅')} Sent: <b>{sent_ok}</b>\n"
-            f"{em(EMOJI_CROSS, '❌')} Failed: <b>{sent_fail}</b>\n"
-            f"{em(EMOJI_FIRE, '🔥')} APIs: <b>{len(api_usage_delta)}</b>"
-            f"{duration_text}{credit_text}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_btn]),
-            parse_mode="HTML")
-    except Exception as e:
-        log.error(f"Final msg edit fail: {e}")
+    """Reject legacy send-flow calls without storing or transmitting their data."""
+    await msg.answer("Bulk SMS delivery is disabled in this imported copy. No message was sent.")
 
 @R.callback_query(F.data == "user:stop_send")
 async def user_stop_send(cq: CallbackQuery, state: FSMContext):
@@ -3548,7 +3158,7 @@ async def user_pricing(cq: CallbackQuery, state: FSMContext):
 async def user_info(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text(
         f"{em(EMOJI_GEAR, 'ℹ️')} <b>Bot {_VERSION}</b>\n\n"
-        f"🤖 Bulk SMS via Firebase devices.\n\n"
+        f"🤖 Bulk SMS delivery is disabled in this imported copy.\n\n"
         f"👤 Developer: <b>{OWNER_NAME}</b>\n"
         f"💬 Support: {SUPER_ADMIN_LINK}\n\n"
         f"<i>Referral se free credits paayein!</i>",
@@ -3635,7 +3245,8 @@ async def user_transfer_amount_invalid(msg: Message):
 async def main():
     global PROTECTED_NUMBERS, AUTO_CLEANUP_ENABLED
 
-    # Initialize MongoDB first
+    validate_configuration()
+    # Initialize MongoDB only after required settings are verified.
     await init_mongo()
 
     bot = Bot(token=BOT_TOKEN)
@@ -3650,8 +3261,7 @@ async def main():
     me = await bot.get_me()
     log.info(f"@{me.username} — {_VERSION} started! Owner: {OWNER_NAME}")
 
-    scanner_task = asyncio.create_task(background_firebase_scanner(bot))
-    log.info("Scanner task created")
+    log.info("Firebase scanner is disabled in this imported copy")
 
     try:
         await bot.send_message(MAIN_OWNER,
@@ -3662,16 +3272,11 @@ async def main():
             f"📢 Log Channel: <code>{LOG_CHANNEL_ID}</code>\n"
             f"💾 <b>Database:</b> MongoDB (olympic)\n"
             f"🗑 <b>Auto-Cleanup:</b> {'🟢 ON' if AUTO_CLEANUP_ENABLED else '🔴 OFF'}\n\n"
-            f"✅ <b>All Features Active:</b>\n"
-            f"• 🔍 One-time FB check at add\n"
-            f"• 📥 Online Firebase TXT Export\n"
-            f"• 🗑 Auto-Delete Toggle (Settings)\n"
-            f"• ⚠️ Delete All Firebases\n"
-            f"• 🗑 Manual Clean Now\n"
-            f"• 💎 Premium icons & layout\n"
-            f"• 💾 MongoDB (olympic db)\n"
-            f"• 🛡 Role metadata tracking\n"
-            f"• 🔒 Safe HTTPS-only FB URLs",
+            f"✅ <b>Safe mode:</b>\n"
+            f"• SMS delivery disabled\n"
+            f"• Firebase probing and device discovery disabled\n"
+            f"• 💾 MongoDB state management\n"
+            f"• 🛡 Role metadata controls",
             parse_mode="HTML")
     except Exception as e:
         log.warning(f"Owner notify: {e}")
